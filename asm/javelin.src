@@ -1,0 +1,5144 @@
+; JVM.src
+;
+; Java Virtual Machine for the JEM project.
+;
+; Copyright (c) 1998-2002 Christopher Waters. All rights reserved.
+;
+
+; Device Information
+		DEVICE	 OSCHS2, PROTECT, WDT_ON, SLEEPCLOCK, BOR42
+
+		id	'J'
+		reset	Init
+		FREQ	25_000_000
+;--------------------------------------------------------------------------
+; TO DO:
+;   * The SetPinOut and any other routine that modifies the mode register
+;     needs to be made immune to interruption by ISR.
+;--------------------------------------------------------------------------
+
+;SXDEBUG	; Define this to use SXKey debug mode.
+FASTLOAD
+;EEPROMFETCH	; Set this to read instructions from EEPROM rather than SRAM.
+
+; Debugger watches.
+
+watch JVM_PC_MSB,8,uhex
+watch JVM_PC_LSB,8,uhex
+watch JVM_SP_MSB,8,uhex
+watch JVM_SP_LSB,8,uhex
+watch JVM_FP_MSB,8,uhex
+watch JVM_FP_LSB,8,uhex
+watch JVM_HP_MSB,8,uhex
+watch JVM_HP_LSB,8,uhex
+watch OP_MSB,8,uhex
+watch OP_LSB,8,uhex
+watch OP2_MSB,8,uhex
+watch OP2_LSB,8,uhex
+watch JVM_METHOD_MSB,8,uhex
+watch JVM_METHOD_LSB,8,uhex
+watch SRAMAddressMSB,8,uhex
+watch SRAMAddressLSB,8,uhex
+
+;--------------------------------------------------------------------------
+; Stack frame format
+;
+; the following format:
+;
+; +---------------+
+; | Local0        | <- JVM_FP
+; | ...           |
+; | LocalN        |
+; +---------------+
+; | Method MSB    |
+; +---------------+
+; | Method LSB    |
+; +---------------+
+; | Old FP MSB    |
+; +---------------+
+; | Old FP LSB    |
+; +---------------+
+; | JVM_PC MSB    |
+; +---------------+
+; | JVM_PC LSB    |
+; +---------------+
+; | Stack0        | <- JVM_SP
+; | ....          |
+; +---------------+
+;
+; When a function is called:
+;   1. The SP is incremented by the number of local variables.
+;   2. The SP minus the number of locals is pushed on the stack.
+;   3. The current PC is pushed.
+;
+; When a function returns:
+;   1. The PC is popped.
+;   2. The next byte is popped into JVM_STACK_POP
+;   3. The return value is pushed onto the stack
+;
+; Library functions do not use the JVM stack and so do not follow these
+; conventions. It is up to individual library functions to pop their
+; arguments off the stack and push on any return value.
+;
+; Each stack entry is two bytes stored MSB,LSB.
+;
+; The method pointer points to the method info in the .jem file.
+;
+;--------------------------------------------------------------------------
+
+; Jem opcodes.
+	j_nop	=	0
+	j_iconst_m1	=	1
+	j_iconst_0	=	2
+	j_iconst_1	=	3
+	j_iconst_2	=	4
+	j_iconst_3	=	5
+	j_iconst_4	=	6
+	j_iconst_5	=	7
+	j_bipush	=	8
+	j_sipush	=	9
+	j_iload	=	10
+	j_iload_0	=	11
+	j_iload_1	=	12
+	j_iload_2	=	13
+	j_iload_3	=	14
+	j_istore	=	15
+	j_istore_0	=	16
+	j_istore_1	=	17
+	j_istore_2	=	18
+	j_istore_3	=	19
+	j_ifeq	=	20
+	j_ifne	=	21
+	j_iflt	=	22
+	j_ifle	=	23
+	j_ifgt	=	24
+	j_ifge	=	25
+	j_if_icmpeq	=	26
+	j_if_icmpne	=	27
+	j_if_icmplt	=	28
+	j_if_icmpge	=	29
+	j_if_icmpgt	=	30
+	j_if_icmple	=	31
+	j_if_acmpeq	=	32
+	j_if_acmpne	=	33
+	j_ireturn	=	34
+	j_return	=	35
+	j_invokevirtual	=	36
+	j_invokestatic	=	37
+	j_getstatic	=	38
+	j_putstatic	=	39
+	j_pop	=	40
+	j_pop2	=	41
+	j_dup	=	42
+	j_dup_x1	=	43
+	j_dup_x2	=	44
+	j_dup2	=	45
+	j_dup2_x1	=	46
+	j_dup2_x2	=	47
+	j_swap	=	48
+	j_iadd	=	49
+	j_isub	=	50
+	j_ineg	=	51
+	j_ior	=	53
+	j_ishl	=	55
+	j_ishr	=	57
+	j_iushr	=	59
+	j_iand	=	61
+	j_ixor	=	63
+	j_i2b	=	65
+	j_goto	=	67
+	j_invokeinterface	=	69
+	j_arraylength	=	71
+	j_athrow	=	73
+	j_checkcast	=	75
+	j_instanceof	=	77
+	j_wide	=	79
+	j_iinc	=	81
+	j_getfield	=	83
+	j_putfield	=	85
+	j_new	=	87
+	j_newarray	=	89
+	j_anewarray	=	91
+	j_iaload	=	93
+	j_iastore	=	95
+	j_baload	=	97
+	j_bastore	=	99
+	j_ldc	=	101
+	j_ldc_w	=	103
+	j_ldc2_w	=	105
+	j_imul	=	107
+	j_idiv	=	109
+	j_irem	=	111
+	j_jsr	=	113
+	j_ret	=	115
+	j_tableswitch	=	117
+	j_lookupswitch	=	119
+
+;--------------------------------------------------------------------------
+; Jem .jem file format
+;
+; The Java .class file is condensed into a .jem file by the host based
+; compaction program.
+;
+; See the file CJEMLinker.h for the .jem file format.
+;
+;--------------------------------------------------------------------------
+
+; Set the bank on an SX52.
+_bank	MACRO	1
+	bank	\1
+	IF \1 & %10000000
+		setb	fsr.7
+	ELSE
+		clrb 	fsr.7
+	ENDIF
+	ENDM
+
+;--------------------------------------------------------------------------
+; Constants
+;--------------------------------------------------------------------------
+
+JVMDebug	=	1	; Set to 1 to enable the debugger.
+
+IF JVMDebug = 1
+rx_pin		=	ra.1
+tx_pin		=	ra.0
+sin		=	ra.1
+sout		=	ra.0
+ENDIF
+
+IFDEF FASTLOAD
+	; .jem file constants
+	JEMSFOffset	=	3	; Offset to the number of static fields.
+	JEMMainOffset	=	4	; Offset to the 'main' method stub.
+	JEMClassOffset	=	6	; Offset to the class offsets.
+ELSE
+	; .jem file constants
+	JEMSFOffset	=	2	; Offset to the number of static fields.
+	JEMMainOffset	=	3	; Offset to the 'main' method stub.
+	JEMClassOffset	=	5	; Offset to the class offsets.
+ENDIF
+
+
+JEMNativeMethod	=	7	; Bit 7 of the code offset MSB is set if a
+				; method is native.
+
+kMaxBreakpoints	=	7	; Maximum number of breakpoints allowed.
+
+kMemSize 	= 	$8000
+kProgSize	=	$2000
+JVM_HEAP_BASE	=	$7FFF	; The first free byte at top of memory.
+kProgramStart	=	$0000	; Position of the program in RAM.
+
+kDebugMagic	=	$1D	; First byte of .jem file for debugging.
+kRunMagic	=	$A4	; First byte of .jem file for running.
+kEndMagic	=	$ED	; First byte of .jem file when program has ended.
+
+;-------------------------------------------------------------------------------
+; Exceptions
+;
+; This list needs to be the same as java.lang.Throwable
+;-------------------------------------------------------------------------------
+
+eIllegalArgumentException	=	1
+eNullPointerException		=	2
+eArrayIndexOutOfBoundsException	=	3
+eOutOfMemoryError		=	4
+
+;-------------------------------------------------------------------------------
+; Chip Constants
+;-------------------------------------------------------------------------------
+
+MODE_READ_TCNTB =	$06
+MODE_WRITE_TCNTB =	$16
+MODE_WRITE_DIR	=	$1f
+
+;-------------------------------------------------------------------------------
+; SRAM Constants
+;-------------------------------------------------------------------------------
+
+SRAMDataBus	=	re
+SRAMAddrBus	=	rd
+SRAMWriteEnable	=	ra.3
+SRAMChipSelect	=	ra.2
+SRAMLatchEnable	=	rd.7
+SRAMResetFlag	=	ra.7
+
+;-------------------------------------------------------------------------------
+; I2C Constants
+;-------------------------------------------------------------------------------
+
+; New boards.
+i2c_port	=	re
+i2c_scl		=	i2c_port.0	;I2C clock
+i2c_sda		=	i2c_port.2	;I2C data I/O
+i2c_control_r	=	%10100001	;control byte: read E2PROM
+i2c_control_w	=	%10100000	;control byte: write E2PROM
+i2c_portsetup_r	=	%11111110	;Port C config: read bit
+i2c_portsetup_w	=	%11111010	;Port C config: write bit
+i2c_time	=	3		;bit cycle delay (17=0.34 usec)
+
+; Old boards.
+;i2c_port	=	re
+;i2c_scl		=	i2c_port.1	;I2C clock
+;i2c_sda		=	i2c_port.0	;I2C data I/O
+;i2c_control_r	=	%10100001	;control byte: read E2PROM
+;i2c_control_w	=	%10100000	;control byte: write E2PROM
+;i2c_portsetup_r	=	%11111101	;Port C config: read bit
+;i2c_portsetup_w	=	%11111100	;Port C config: write bit
+;i2c_time	=	17		;bit cycle delay (17=0.34 usec)
+
+;--------------------------------------------------------------------------
+; Global variables
+;--------------------------------------------------------------------------
+
+		org	$a
+
+SCRATCH0	ds	1	; Only used in opcodes, preserved by
+				; subroutines
+SCRATCH1	ds	1	; Not preserved by subroutines
+OP_MSB		ds	1	; Operand most significant byte
+OP_LSB		ds	1	; Operand least significant byte
+OP2_MSB		ds	1	; Operand 2 LSB
+OP2_LSB		ds	1	; Operand 2 MSB
+
+;--------------------------------------------------------------------------
+; JVM variables
+;--------------------------------------------------------------------------
+
+		org	$10
+
+JVMVars		=	$
+JVM_PC_LSB	ds	1	; JVM program counter (PC).
+JVM_PC_MSB	ds	1
+JVM_SP_LSB	ds	1	; JVM stack pointer (SP).
+JVM_SP_MSB	ds	1
+JVM_FP_LSB	ds	1	; JVM frame pointer (FP).
+JVM_FP_MSB	ds	1
+JVM_METHOD_MSB	ds	1	; Current method stub pointer.
+JVM_METHOD_LSB	ds	1
+JVM_HP_LSB	ds	1	; Heap pointer (HP). Points to the next free
+JVM_HP_MSB	ds	1	; byte in the heap. The heap grows
+				; downwards in memory, towards the stack.
+JVM_OPCODE	ds	1	; Last opcode.
+OP3_MSB		ds	1	; Third operand MSB.
+OP3_LSB		ds	1	; Third operand LSB.
+SRAMAddressMSB	ds	1	; The SRAM address.
+SRAMAddressLSB	ds	1
+JVM_FLAGS	ds	1
+EEAddressMSB	=	SRAMAddressMSB	; Address in the EEPROM.
+EEAddressLSB	=	SRAMAddressLSB
+
+UNUSED_FLAG	=	JVM_FLAGS.0	; 
+JVM_CARRY_FLAG	=	JVM_FLAGS.1	; Carry flag.
+JVM_ESET_FLAG	=	JVM_FLAGS.2	; Exception PC set flag.
+JVM_NEG_FLAG	=	JVM_FLAGS.3	; Negative flag used by divide.
+
+;--------------------------------------------------------------------------
+; Breakpoint variables
+;--------------------------------------------------------------------------
+
+		org	$20
+
+BPVars		=	$
+JVM_BP_COUNT	ds	1	; The number of breakpoints.
+; The breakpoints are stored LSB first.
+; The breakpoints must all be in the same bank.
+JVM_BP		ds	kMaxBreakpoints * 2	; Space for the breakpoints.
+BPEnd		=	$
+
+;--------------------------------------------------------------------------
+; Exception handling variables
+;--------------------------------------------------------------------------
+
+		org	$30
+ExceptionVars	=	$
+JVM_EObject_MSB	ds	1	; Pointer to the thrown object
+JVM_EObject_LSB	ds	1
+JVM_EPC_MSB	=	OP3_MSB	; Temporary PC storage.
+JVM_EPC_LSB	=	OP3_LSB
+JVM_EType_MSB	ds	1	; Class pointer of the thrown object.
+JVM_EType_LSB	ds	1
+JVM_ECount	ds	1	; Number of exception handlers in table.
+JVM_TPC_MSB	ds	1	; PC that the exception was thrown from.
+JVM_TPC_LSB	ds	1
+
+;--------------------------------------------------------------------------
+; Offsets
+;--------------------------------------------------------------------------
+
+		org	$40
+OffsetVars	=	$
+JVM_Object_MSB	ds	1	; Offset to the java.lang.Object class.
+JVM_Object_LSB	ds	1
+JVM_String_MSB	ds	1	; Offset to the java.lang.String class.
+JVM_String_LSB	ds	1
+JVM_Throw_MSB	ds	1	; Offset to the throwVMException method.
+JVM_Throw_LSB	ds	1
+JVM_STable_MSB	ds	1	; Offset to the string table.
+JVM_STable_LSB	ds	1
+JVM_CallbackMSB	ds	1	; Offset to the callback routine.
+JVM_CallbackLSB	ds	1
+JVM_OOM_MSB	ds	1	; Offset to the OutOfMemoryError class.
+JVM_OOM_LSB	ds	1
+JVM_SB_MSB	ds	1	; Stack base (also end of program in EEPROM.
+JVM_SB_LSB	ds	1
+LastOffsetVar	=	$
+
+		org	$50
+JVMVars2	=	$
+OP4_MSB		ds	1
+OP4_LSB		ds	1
+SRAMVars	=	$
+JVM_SF_MSB	ds	1	; Static fields pointer (MSB).
+JVM_SF_LSB	ds	1	; Static fields pointer (MSB).
+
+;--------------------------------------------------------------------------
+; I2C variables
+;--------------------------------------------------------------------------
+
+I2C             =     $			;I2C bank
+
+i2c_data	ds	1		;data byte from/for R/W
+i2c_count	ds	1		;bit count for R/W
+i2c_byte	ds	1		;temporary UART/I2C shift reg.
+i2c_flag	ds	1		;Flags
+i2c_sequential	=	i2c_flag.0	;Whether to do sequential read.
+i2c_temp	ds	1		;temporary storage
+i2c_address_lsb	ds	1
+i2c_address_msb	ds	1
+i2c_in_bit	=	i2c_byte.0	;bit to receive on I2C
+i2c_out_bit	=	i2c_byte.7	;bit to transmit on I2C
+
+;--------------------------------------------------------------------------
+; Debugger variables
+;--------------------------------------------------------------------------
+
+IF JVMDebug = 1
+		org	$60
+serial		=	$
+debugger	=	$
+
+tx_high		ds	1	;tx
+tx_low		ds	1
+tx_count	ds	1
+tx_divide	ds	1
+
+rx_count	ds	1	;rx
+rx_divide	ds	1
+rx_byte		ds	1
+rx_flag		ds	1
+
+DebugState	ds	1	; Stete of the debugger
+opcode		ds	1	; Current opcode
+dTemp0		= 	OP_LSB	; Temporary variable for debugger
+dTemp1		=	OP_MSB
+debugChecksum	ds	1	; Running checksum of received command.
+termBufferMSB	ds	1	; Pointer to the buffer for the terminal interface.
+termBufferLSB	ds	1
+termHeadPtr	ds	1	; Head pointer for terminal buffer.
+ENDIF
+
+
+;--------------------------------------------------------------------------
+; Native method variables
+;--------------------------------------------------------------------------
+
+nmInterruptFlag	=	ra.6
+
+nmBlockBank	=	$70	; Bank for blocking routines
+
+nmPeriph0Bank	=	$80
+nmPeriph1Bank	=	$90
+nmPeriph2Bank	=	$A0
+nmPeriph3Bank	=	$B0
+nmPeriph4Bank	=	$C0
+nmPeriph5Bank	=	$D0
+
+nmResultH	=	OP_MSB			;Global: Result value
+nmResultL	=	OP_LSB			;Global: Result value
+nmTemp		=	Scratch0		;Global
+
+nmPeriphISRVec	=	$10			;Register in periph0 or periph1 bank
+nmPeriphRetVec	=	$11			;Register in periph0 or periph1 bank
+
+nmPort0		=	rb			;Port 0 = Port B
+nmPort1		=	rc			;Port 1 = Port C
+
+;--------------------------------------------------------------------------
+; Temporary storage bank. Used to buffer program during download.
+;--------------------------------------------------------------------------
+
+		org	$E0
+TempVars	=	$
+
+;--------------------------------------------------------------------------
+; Macros
+;--------------------------------------------------------------------------
+
+INC_POINTER	macro	2
+	inc	\1
+	snz
+	inc	\2
+	endm
+
+DEC_POINTER	macro	2
+	test	\1
+	snz
+	dec	\2
+	dec	\1
+	endm
+
+; Increment the SRAM address pointer
+INC_SRAM_ADDRESS	macro
+	INC_POINTER	SRAMAddressLSB,SRAMAddressMSB
+	endm
+
+; Increment the EE address pointer
+INC_EE_ADDRESS	macro
+	INC_POINTER	EEAddressLSB,EEAddressMSB
+	endm
+
+; Decrement the SRAM address pointer
+DEC_SRAM_ADDRESS	macro
+	DEC_POINTER	SRAMAddressLSB,SRAMAddressMSB
+	endm
+
+; Increment the stack pointer
+INC_SP	macro
+	INC_POINTER	JVM_SP_LSB,JVM_SP_MSB
+	endm
+
+; Decrement the stack pointer
+DEC_SP	macro
+	DEC_POINTER	JVM_SP_LSB,JVM_SP_MSB
+	endm
+
+; Increment the program counter
+INC_PC	macro
+	INC_POINTER	JVM_PC_LSB,JVM_PC_MSB
+	endm
+
+; Decrement the program counter
+DEC_PC	macro
+	DEC_POINTER	JVM_PC_LSB,JVM_PC_MSB
+	endm
+
+; Increment the heap pointer
+INC_HP	macro
+	INC_POINTER	JVM_HP_LSB,JVM_HP_MSB
+	endm
+
+; Increment the heap pointer
+DEC_HP	macro
+	DEC_POINTER	JVM_HP_LSB,JVM_HP_MSB
+	endm
+
+; Add a constant to the program counter.
+ADD_PC	macro	1
+	add	JVM_PC_LSB,#\1
+	snc
+	inc	JVM_PC_MSB
+	endm
+
+; Increment the method pointer
+INC_MP	macro
+	INC_POINTER	JVM_METHOD_LSB,JVM_METHOD_MSB
+	endm
+
+; Decrement the method pointer
+DEC_MP	macro
+	DEC_POINTER	JVM_METHOD_LSB,JVM_METHOD_MSB
+	endm
+
+; Goto the next op code.
+NEXT_OP		macro
+		jmp	@JVMLoadOp	; Load the next op
+		endm
+
+; Transmit a byte for debugging
+DEBUGB	macro
+	mov	w,\1
+	call	@DebugSendByteNoTrans
+	bank	JVMVars
+endm
+
+;--------------------------------------------------------------------------
+; Interrupt code
+;--------------------------------------------------------------------------
+
+	ORG	$000
+
+; ==============================================================================
+;  Interrupt Handler
+; ==============================================================================
+;  Description:
+;      Interrupts every 217 cycles = 8.68us
+;      Length (no VPs) = 25 cycles (+ 3 for interrupt latency = 28)
+;      Overhead = 28/217 = 13%
+; ==============================================================================
+
+;	org	$000
+
+ISR	setb	nmInterruptFlag			;1  Signal interrupt.
+ISR0	mov	FSR, #nmPeriph0Bank		;2  Peripheral 0 bank
+	mov	w, nmPeriphISRVec		;1  Find peripheral vector
+	jmp	w				;3  Jump to peripheral vector
+ISR1	mov	FSR, #nmPeriph1Bank		;2  Peripheral 1 bank
+	mov	w, nmPeriphISRVec		;1  Find peripheral vector
+	jmp	w				;3  Jump to peripheral vector
+ISR2	mov	FSR, #nmPeriph2Bank		;2  Peripheral 2 bank
+	mov	w, nmPeriphISRVec		;1  Find peripheral vector
+	jmp	w				;3  Jump to peripheral vector
+ISR3	mov	FSR, #nmPeriph3Bank		;2  Peripheral 3 bank
+	mov	w, nmPeriphISRVec		;1  Find peripheral vector
+	jmp	w				;3  Jump to peripheral vector
+ISR4	mov	FSR, #nmPeriph4Bank		;2  Peripheral 4 bank
+	mov	w, nmPeriphISRVec		;1  Find peripheral vector
+	jmp	w				;3  Jump to peripheral vector
+ISR5	mov	FSR, #nmPeriph5Bank		;2  Peripheral 5 bank
+	mov	w, nmPeriphISRVec		;1  Find peripheral vector
+	jmp	w				;3  Jump to peripheral vector
+ISRRet
+	jmp	@DebugISR			;4
+
+nmPeriph0RetVec		=	ISR1		;Periph0 return vector
+nmPeriph1RetVec		=	ISR2		;Periph1 return vector
+nmPeriph2RetVec		=	ISR3		;Periph2 return vector
+nmPeriph3RetVec		=	ISR4		;Periph2 return vector
+nmPeriph4RetVec		=	ISR5		;Periph2 return vector
+nmPeriph5RetVec		=	ISRRet		;Periph3 return vector
+
+	org	$+2
+
+Init	jmp	@DoInit
+
+;--------------------------------------------------------------------------
+; Native Method Virtual Peripherals
+;--------------------------------------------------------------------------
+
+; ==============================================================================
+;  ISR Global routines
+; ==============================================================================
+
+nmIsrOutputPort		=	$1E
+nmIsrOutputPin		=	$1F
+
+nmIsrOutputHigh					;	9 cycles
+	mov	w, nmIsrOutputPin		;1	Set output pin: w = pin mask
+	sb	nmIsrOutputPort.0		;1/2	Port 0 ?
+	or	nmPort0, w			;1	Yes => set bit
+	snb	nmIsrOutputPort.0		;1/2	Port 1 ?
+	or	nmPort1, w			;1	Yes => set bit
+	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector (18 cycles)
+
+nmIsrOutputLow					;	9 cycles
+	mov	w, /nmIsrOutputPin		;1	Clear output pin: w = !(pin mask)
+
+	sb	nmIsrOutputPort.0		;1/2	Port 0 ?
+	and	nmPort0, w			;1	Yes => clear bit
+	snb	nmIsrOutputPort.0		;1/2	Port 1 ?
+	and	nmPort1, w			;1	Yes => clear bit
+nmIsrReturn					;	4 cycles
+	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector (18 cycles)
+
+; ==============================================================================
+;  Uart
+; ==============================================================================
+
+nmUart2400	=	 96
+nmUart4800	=	 48
+nmUart7200	=	 32
+nmUart9600	=	 24
+nmUart14400	=	 16
+nmUart19200	=	 12
+nmUart38400	=	  6
+nmUart57600	=	  4
+nmUart115200	=	  2
+
+nmPeriphISRVec		=	$10		;Peripheral
+nmPeriphRetVec		=	$11		;Peripheral
+
+nmUartBitsH		=	$12		;Internal
+nmUartBitsL		=	$13		;Internal
+nmUartDivide		=	$14		;Internal
+
+nmUartInvert		=	$15		;External: LSB = Data invert flag, LSB+1 = HS invert flag
+nmUartBaud		=	$16		;External: Value = 1000000/(bps * 4.34)
+nmUartStopBits		=	$17		;External for Tx only: 00000001 for 1 stop bit, 00000011 for 2 etc
+
+nmUartHead		=	$18		;External
+nmUartTail		=	$19		;External
+nmUartBufferH		=	$1A		;External
+nmUartBufferL		=	$1B		;External
+
+nmUartPort		=	$1C		;External: LSB = 0 for Port0, 1 for Port1
+nmUartPin		=	$1D		;External: Value = bit mask (1 of 8 set)
+nmUartHSPort		=	nmIsrOutputPort	;=$1E	External: LSB = 0 for Port0, 1 for Port1
+nmUartHSPin		=	nmIsrOutputPin	;=$1F	External: Value = bit mask (1 of 8 set)
+
+nmUartTxAddrH		=	nmUartBitsH	;Internal
+nmUartTxAddrL		=	nmUartBitsL	;Internal
+nmUartRxAddrH		=	nmUartBitsH	;Internal
+nmUartRxAddrL		=	nmUartStopBits	;Internal
+nmUartRxBitCount	=	nmUartBitsH	;Internal
+
+; ==============================================================================
+
+nmUartTxIdle					;	10/18/26 cycles
+	mov	w, nmUartHead			;1	Head pointer
+	xor	w, nmUartTail			;1	Compare with Tail pointer
+	snz					;1/2	Head = Tail ?
+	jmp	:End				;3	Yes => nothing to send
+:HS	mov	w, nmPort0			;1	No  => check handshaking, read Port0
+	snb	nmUartHSPort.0			;1/2	handshaking Port 1 ?
+	mov	w, nmPort1			;1	Yes => read Port1
+	snb	nmUartInvert.1			;1/2	Invert handshaking ?
+	xor	w, #$ff				;1	Yes => invert
+	and	w, nmUartHSPin			;1	z = true for ok, false for not ok
+	sz					;1/2	HS ok to transmit ?
+	jmp	:End				;3	No => do nothing
+:Addr	mov	w, nmUartBufferL		;1	Get buffer pointer low
+	add	w, nmUartTail			;1	Add offset
+	mov	nmUartTxAddrL, w		;1	Store address low
+	mov	w, nmUartBufferH		;1	Get buffer pointer high
+	mov	nmUartTxAddrH, w		;1	Store address high
+	snc					;1/2	Low carry ?
+	inc	nmUartTxAddrH			;1	Yes => inc address high
+	dec	nmUartDivide			;1	Correct divide to compensate for TxRead
+	mov	nmPeriphISRVec, #nmUartTxRead	;2	Change to read state
+:End	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector
+
+
+nmUartTxRead					;	31 cycles
+	mov	w, #$1F				;1	Prepare to write DDR
+	mov	m, w				;1	Prepare to write DDR
+	setb	SRAMChipSelect			;1	Deactivate CS
+	mov	SRAMAddrBus, nmUartTxAddrH	;2	Output address high
+	mov	SRAMDataBus, nmUartTxAddrL	;2	Output address low
+	mov	!SRAMDataBus, #$00		;2	Make data bus output
+	setb	SRAMLatchEnable			;1	Latch data
+	clrb	SRAMLatchEnable			;1	Latch data
+	mov	!SRAMDataBus, #$FF		;2	Make data port all inputs
+	setb	SRAMWriteEnable			;1	Set ~WE for a read cycle
+	clrb	SRAMChipSelect			;1	Activate CS
+	nop					;1	Compensate for slow SRAM
+	clc					;1	Read dead cycle!, Start bit is 0
+	mov	w, <<SRAMDataBus		;1	Read the value from the port.
+	setb	SRAMChipSelect			;1	Deactivate CS
+	mov	nmUartBitsL, w			;1	Store value to be sent
+	mov	nmUartBitsH, nmUartStopBits	;2	Store stop bits
+	rl	nmUartBitsH			;1	Add MSB of data byte to BitsH (stop bits - initialized in TxIdle)
+	inc	nmUartTail			;1	Update pointer
+	setb	SRAMResetFlag			;1	Indicate SRAM access has occured
+	mov	nmPeriphISRVec, #nmUartTxDivide	;2	Change to TxRead state
+	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector
+
+
+nmUartTxDivide					;	8/29/30 cycles
+	decsz	nmUartDivide			;1/2	Divider = 0 ?
+	jmp	:End				;3	No  => Jump to return vector (8 cycles to end)
+	mov	w, #%00000001			;1	Invert mask
+	snb	nmUartInvert.0			;1/2	Invert data ?
+	xor	nmUartBitsL, w			;1	Yes => invert LSB
+	snb	nmUartBitsL.0			;1/2	Output Low ?
+	jmp	:High				;3	No => Output high
+:Low	mov	w, /nmUartPin			;1	w = !(pin mask)
+	sb	nmUartPort.0			;1/2	Port 0 ?
+	and	nmPort0, w			;1	Yes => clear bit
+	snb	nmUartPort.0			;1/2	Port 1 ?
+	and	nmPort1, w			;1	Yes => clear bit
+	jmp	:Next				;3	25 cycles to end
+:High	mov	w, nmUartPin			;1	w = pin mask
+	sb	nmUartPort.0			;1/2	Port 0 ?
+	or	nmPort0, w			;1	Yes => set bit
+	snb	nmUartPort.0			;1/2	Port 1 ?
+	or	nmPort1, w			;1	Yes => set bit
+:Next	mov	nmUartDivide, nmUartBaud	;2	Reset divide count
+	clc					;1	Stop bit = 1 => shift in 0's for test
+	rr	nmUartBitsH			;1	Shift bits
+	rr	nmUartBitsL			;1	Shift bits
+	test	nmUartBitsL			;1	If data bits 0 then complete
+	snz					;1/2	Complete ?
+	snb	nmUartBitsH.0			;1/2    Mabey, Check high byte, Complete ?
+	jmp	:End				;3	No => Jump to return vector
+	mov	w, #nmUartTxIdle		;1	If complete then will change to idle state
+	mov	nmPeriphISRVec, w		;1	Yes => change to idle state
+:End	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector
+
+; ==============================================================================
+
+nmUartRxIdle					;	14/21 cycles
+	mov	w, nmPort0			;1	read Port0
+	snb	nmUartPort.0			;1/2	Port 1 ?
+	mov	w, nmPort1			;1	Yes => read Port1
+	snb	nmUartInvert.0			;1/2	invert port ?
+	xor	w, #$ff				;1	Yes => invert data
+	and	w, nmUartPin			;1	z = true for start bit, false for idle
+	sz					;1/2	Start bit ?
+	jmp	:End				;3	No => nothing to do
+:Init	clc					;1	Divide = Divide * 1.5
+	mov	w, >>nmUartDivide		;1	Divide = Divide * 1.5
+	add	nmUartDivide, w			;1	Divide = Divide * 1.5
+	sub	nmUartDivide, #2		;2	Correct divide to compensate for handshake
+	mov	nmUartRxBitCount, #9		;2	Get 8 data bits and 1 stop bit
+	mov	nmPeriphISRVec, #nmUartRxHand	;2	Change to RxHand state to continue
+:End	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector
+
+
+nmUartRxHand					;	13/20/21 cycles
+	mov	nmPeriphISRVec, #nmUartRxDivide	;2	Change to RxDivide state to continue
+	mov	w, nmUartHead			;1
+	mov	w,nmUartTail-w
+	jz	nmIsrReturn
+	and	w,#%11110000
+	jnz	nmIsrReturn
+	snb	nmUartInvert.1			;1/2	Invert HS pin ?
+	jmp	nmIsrOutputLow			;12	Yes => output Low
+	jmp	nmIsrOutputHigh			;12	No  => output high
+
+
+nmUartRxDivide					;	8/20/28 cycles
+	decsz	nmUartDivide			;1/2	Divider = 0 ?
+	jmp	:End				;3	No  => Nothing more to do
+:Read	mov	w, nmPort0			;1	Yes => read Port0
+	snb	nmUartPort.0			;1/2	Port 1 ?
+	mov	w, nmPort1			;1	Yes => read Port1
+	and	w, nmUartPin			;1	z = true for 0, false for 1
+	clc					;1	Guess Data = 0
+	sz					;1/2	Is data 1 ?
+	stc					;1	Yes => Data = 1
+	rr	nmUartBitsL			;1	Add bit to data byte
+	mov	nmUartDivide, nmUartBaud	;2	Reset divide count
+	decsz	nmUartRxBitCount		;1/2
+	jmp	:End				;3
+	rl	nmUartBitsL			;1	Recover data
+	mov	w, nmUartBufferL		;1	Get buffer pointer low
+	add	w, nmUartHead			;1	Add offset
+	mov	nmUartRxAddrL, w		;1	Store address low
+	mov	w, nmUartBufferH		;1	Get buffer pointer high
+	mov	nmUartRxAddrH, w		;1	Store address high
+	snc					;1/2	Low carry ?
+	inc	nmUartRxAddrH			;1	Yes => inc address high
+	mov	nmPeriphISRVec, #nmUartRxStore	;2	Change to RxStore state
+:End	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector
+
+; ==============================================================================
+;  PWM
+; ==============================================================================
+;   Total cycle time = 255 * 4.34us = 1.1ms
+;   Value parameter = High time (0 = always low, 255 = always high)
+;   On time  = Value / 255 * 1.1ms
+;   Off time = (255-Value) / 255 * 1.1ms
+;   Average output = Value / 255 * Vdd
+;
+;  Usage:
+;    To install into ISR:
+;      Set nmPwmPort to 0/1 to indicate port0/port1
+;      Set nmPwmPin to the bitmask of the desired pin (1 of 8 a '1')
+;      Call nmPwmCreate(nmPwmPeriphBankL = PeriphBank)
+;      Pin will be made an output
+;    To remove from ISR:
+;      Call nmPwmDestroy(nmPwmPeriphBankL = PeriphBank)
+;      Pin will remain an output and be driven low
+;    To update PWM value:
+;      Call nmPwmEqualArea(nmPwmPeriphBankL = PeriphBank, nmPwmTimeL = High time value)
+; ==============================================================================
+
+;Peripheral Bank
+nmPeriphISRVec		=	$10		;Peripheral
+nmPeriphRetVec		=	$11		;Peripheral
+
+nmPwmHighCountHi	=	$12		;Internal
+nmPwmHighCountLo	=	$13		;Internal
+nmPwmLowCountHi		=	$14		;Internal
+nmPwmLowCountLo		=	$15		;Internal
+nmPwmHighTimeHi		=	$16
+nmPwmHighTimeLo		=	$17
+nmPwmLowTimeHi		=	$18
+nmPwmLowTimeLo		=	$19
+nmPwmLowZero		=	$1B
+nmPwmHighZero		=	$1D
+
+nmPwmPort		=	nmIsrOutputPort	;External: Value = 0 for Port0, 1 for Port1
+nmPwmPin		=	nmIsrOutputPin	;External: Value = bit mask (1 of 8 set)
+
+;Blocking Bank
+nmPwmPeriphBankH	=	$10		;1st parameter = bank
+nmPwmPeriphBankL	=	$11		;1st parameter = bank
+nmPwmValue		=	$13		;2nd parameter = value
+
+; ==============================================================================
+
+nmPwmHigh					;	8/21/25/27 cycles
+ifndef SXDEBUG
+	decsz	nmPwmHighCountLo		;1/2	High time complete ?
+	jmp	nmIsrReturn			;7	No => return
+	decsz	nmPwmHighCountHi		;1/2	High time complete ?
+	jmp	nmIsrReturn			;7	No => return
+	test	nmPwmLowZero			;1	Is low time > 0 ?
+	sz					;1/2
+	jmp	nmPwmSetLow			;3	Yes => change to low state
+nmPwmUpdate
+	mov	nmPwmLowCountHi, nmPwmLowTimeHi	;2	Update low counter
+	mov	nmPwmLowCountLo, nmPwmLowTimeLo	;2
+	mov	nmPwmHighCountHi, nmPwmHighTimeHi	;2	Update high counter
+	mov	nmPwmHighCountLo, nmPwmHighTimeLo	;2
+	test	nmPwmHighZero
+	sz					;1/2	High time = 0 ?
+	jmp	nmPwmSetHigh			;3	No => high state
+nmPwmSetLow
+	mov	nmPeriphISRVec, #nmPwmLow	;2	Change to low state
+	jmp	nmIsrOutputLow			;12	Output low and return
+nmPwmSetHigh
+	mov	nmPeriphISRVec, #nmPwmHigh	;2	Change to high state
+	jmp	nmIsrOutputHigh			;12	Output high and return
+
+nmPwmLow					;	8/25/27 cycles
+	decsz	nmPwmLowCountLo			;1/2	Low time complete ?
+	jmp	nmIsrReturn			;7	No => return
+	decsz	nmPwmLowCountHi			;1/2	Low time complete ?
+	jmp	nmIsrReturn			;7	No => return
+	jmp	nmPwmUpdate			;3	Load new values
+endif
+
+; ==============================================================================
+;  DAC
+; ==============================================================================
+
+;Peripheral Bank
+nmPeriphISRVec		=	$10		;Peripheral
+nmPeriphRetVec		=	$11		;Peripheral
+
+nmDacAcc		=	$12		;Internal: Accumulator
+
+nmDacValue		=	$1B		;External: Value to output
+
+nmDacPort		=	nmIsrOutputPort	;External: Value = 0 for Port0, 1 for Port1
+nmDacPin		=	nmIsrOutputPin	;External: Value = bit mask (1 of 8 set)
+
+; ==============================================================================
+
+nmDac						;	15/16 cycles
+	add	nmDacAcc, nmDacValue		;2	Add output value to accumulator
+	sc					;1/2	Overflow ?
+	jmp	nmIsrOutputLow			;12	No  => output low  (15 cycles to end)
+	jmp	nmIsrOutputHigh			;12	Yes => output high (16 cycles to end)
+
+; ==============================================================================
+;  ADC
+; ==============================================================================
+
+;Peripheral Bank
+nmPeriphISRVec		=	$10		;Peripheral
+nmPeriphRetVec		=	$11		;Peripheral
+
+nmAdcAcc		=	$12		;Internal: Accumulator
+nmAdcCount		=	$13		;Internal
+
+nmAdcValue		=	$1B		;External: Measured value
+
+nmAdcInPort		=	$1C		;External: Value = 0 for Port0, 1 for Port1
+nmAdcInPin		=	$1D		;External: Value = bit mask (1 of 8 set)
+nmAdcOutPort		=	nmIsrOutputPort	;External: Value = 0 for Port0, 1 for Port1
+nmAdcOutPin		=	nmIsrOutputPin	;External: Value = bit mask (1 of 8 set)
+
+;Blocking Bank
+nmAdcPeriphBankH	=	$10		;1st parameter = bank
+nmAdcPeriphBankL	=	$11		;1st parameter = bank
+
+; ==============================================================================
+
+nmAdc						;	15/16 cycles
+	incsz	nmAdcCount			;1/2	Counter overflow ?
+	jmp	:Read				;3	No  => still reading
+	mov	nmAdcValue, nmAdcAcc		;2	Yes => update reported value
+	clr	nmAdcAcc			;1	Clear the accumulator
+:Read	mov	w, nmPort0			;1	Read port 0
+	snb	nmAdcInPort.0			;1/2	Port 1 ?
+	mov	w, nmPort1			;1	Yes => read Port1
+	and	w, nmAdcInPin			;1	Mask out bit
+	snz					;1/2	High ?
+:Low	jmp	nmIsrOutputHigh			;12	No => Output high and return
+:High	inc	nmAdcAcc 			;1	Yes => Increment accumulator
+	jmp	nmIsrOutputLow			;12	Output low and return
+
+; ==============================================================================
+
+; ==============================================================================
+;  Timer
+; ==============================================================================
+
+;Peripheral Bank
+nmPeriphISRVec		=	$10		;Peripheral
+nmPeriphRetVec		=	$11		;Peripheral
+
+nmTimer1		=	$12		; Accumulator
+nmTimer2		=	$13
+nmTimer3		=	$14
+nmTimer4		=	$15
+
+nmLatchTimer1		=	$16		; Latch value
+nmLatchTimer2		=	$17
+nmLatchTimer3		=	$18
+nmLatchTimer4		=	$19
+
+nmTimer
+	incsz	nmTimer1
+	jmp	nmIsrReturn
+	incsz	nmTimer2
+	jmp	nmIsrReturn
+	incsz	nmTimer3
+	jmp	nmIsrReturn
+	inc	nmTimer4
+	jmp	nmIsrReturn
+
+; ==============================================================================
+;  UART Cont.
+; ==============================================================================
+
+nmUartRxStore					;	28 cycles
+	mov	w, #$1F				;1	Prepare to write DDR
+	mov	m, w				;1	Prepare to write DDR
+	snb	nmUartInvert.0			;1/2	Invert data ?
+	not	nmUartBitsL			;1	Yes => apply invert
+	setb	SRAMChipSelect			;1	Deactivate CS
+	mov	SRAMAddrBus, nmUartRxAddrH	;2	Output address high
+	mov	SRAMDataBus, nmUartRxAddrL	;2	Output address low
+	mov	!SRAMDataBus, #$00		;2	Make data bus output
+	setb	SRAMLatchEnable			;1	Latch data
+	clrb	SRAMLatchEnable			;1	Release latch
+	mov	SRAMDataBus, nmUartBitsL	;2	Output data onto bus
+	clrb	SRAMWriteEnable			;1	Clear ~WE for a write cycle
+	clrb	SRAMChipSelect			;1	Activate CS
+	nop					;1	Compensate for slow SRAM.
+	setb	SRAMChipSelect			;1	Deactivate CS
+	setb	SRAMWriteEnable			;1	Set ~WE for idle (read)
+	inc	nmUartHead			;1	Update pointer
+	setb	SRAMResetFlag			;1	Indicate SRAM access has occured
+	mov	nmPeriphISRVec, #nmUartRxIdle	;2	Change to RxStop state to wait for idle
+	mov	w, nmPeriphRetVec		;1	Find return vector
+	jmp	w				;3	Jump to return vector
+
+; 19200
+;bitPeriod = 12
+;bitPeriod15 = 18
+; 57600
+bitPeriod = 4
+bitPeriod15 = 6
+
+DebugISR
+	_bank	serial			;2
+	inc	tx_divide		;1
+	mov	w,#bitPeriod		;1
+	mov	w,tx_divide-w		;1
+	jnz	:receive		;4
+	clr	tx_divide		;1
+	test    tx_count                ;1 are we sending?
+	jz      :receive                ;4 if not, go to :receive
+	clc                             ;1 yes, ready stop bit
+	rr      tx_high                 ;1  and shift to next bit
+	rr      tx_low                  ;1
+	dec     tx_count                ;1 decrement bit counter
+	movb    tx_pin,/tx_low.5        ;4 output next bit
+:receive
+	movb    c,rx_pin                ;4 get current rx bit
+	test    rx_count                ;1 currently receiving byte?
+	jnz     :rxbit                  ;4 if so, jump ahead
+	mov     w,#9                    ;1 in case start, ready 9 bits
+	sc                              ;2 skip ahead if not start bit
+	mov     rx_count,w              ;  it is, so renew bit count
+	mov     rx_divide,#bitPeriod15	;2 ready 1.5 bit periods
+:rxbit  djnz    rx_divide,:rxdone       ;4 middle of next bit?
+	mov	rx_divide,#bitPeriod	;2
+	dec     rx_count                ;1 last bit?
+	sz                              ;2 if not
+	rr      rx_byte                 ;  then save bit
+	snz                             ;2 if so
+	setb    rx_flag                 ;  then set flag
+:rxdone
+DebugRet
+	mov	w, #-217		;1  Interrupt every 217 clock cycles (8.68us)
+	retiw				;3  No VPs => 28 /217 cycles = 13%
+
+; ==============================================================================
+;  IsrCreate
+; ==============================================================================
+;  Description:
+;      Initialises ISR values and enables timer
+; ==============================================================================
+
+_nmIsrCreate
+:VP0	mov	FSR, #nmPeriph0Bank		;Peripheral 0 bank
+	mov	w, #nmPeriph0RetVec		;Set default vectors
+	mov	nmPeriphRetVec, w		;Set default vectors
+	mov	nmPeriphISRVec, w		;Set default vectors
+:VP1	mov	FSR, #nmPeriph1Bank		;Peripheral 0 bank
+	mov	w, #nmPeriph1RetVec		;Set default vectors
+	mov	nmPeriphRetVec, w		;Set default vectors
+	mov	nmPeriphISRVec, w		;Set default vectors
+:VP2	mov	FSR, #nmPeriph2Bank		;Peripheral 2 bank
+	mov	w, #nmPeriph2RetVec		;Set default vectors
+	mov	nmPeriphRetVec, w		;Set default vectors
+	mov	nmPeriphISRVec, w		;Set default vectors
+:VP3	mov	FSR, #nmPeriph3Bank		;Peripheral 3 bank
+	mov	w, #nmPeriph3RetVec		;Set default vectors
+	mov	nmPeriphRetVec, w		;Set default vectors
+	mov	nmPeriphISRVec, w		;Set default vectors
+:VP4	mov	FSR, #nmPeriph4Bank		;Peripheral 4 bank
+	mov	w, #nmPeriph4RetVec		;Set default vectors
+	mov	nmPeriphRetVec, w		;Set default vectors
+	mov	nmPeriphISRVec, w		;Set default vectors
+:VP5	mov	FSR, #nmPeriph5Bank		;Peripheral 5 bank
+	mov	w, #nmPeriph5RetVec		;Set default vectors
+	mov	nmPeriphRetVec, w		;Set default vectors
+	mov	nmPeriphISRVec, w		;Set default vectors
+:Timer	mov	w, #%10011111			;Enable RTCC int
+	mov	!option, w			;Enabe RTCC int
+	retp
+
+;--------------------------------------------------------------------------
+; More bytecodes
+;--------------------------------------------------------------------------
+
+_l_j_tableswitch
+	mov	OP_MSB,JVM_PC_MSB	; Save the PC.
+	mov	w,JVM_PC_LSB
+	bank	JVMVars2
+	mov	OP4_LSB,w
+	mov	OP4_MSB,OP_MSB
+	bank	JVMVars
+	call	@JVMGetOpcode		; Read the default jump offset.
+	mov	OP3_MSB,w		; Save it.
+	call	@JVMGetOpcode
+	mov	OP3_LSB,w
+	call	@JVMGetOpcode		; Read the low bound.
+	mov	OP2_MSB,w		; Save it.
+	call	@JVMGetOpcode
+	mov	OP2_LSB,w
+	call	@JVMPush2		; Push the low bound on the stack for the subtraction.
+	call	@DoSub			; Compute Val - low. Result is in OP2_?SB.
+	snb	OP2_MSB.7		; Is the sign bit set?
+	jmp	:offset			; Yes. Val < low so use default entry.
+	call	@JVMGetOpcode		; Read the high bound.
+	mov	OP_MSB,w		; Save it.
+	call	@JVMGetOpcode
+	mov	OP_LSB,w
+	cja	OP2_MSB,OP_MSB,:offset
+	cjb	OP2_MSB,OP_MSB,:doTable
+	cja	OP2_LSB,OP_LSB,:offset
+:doTable
+	clc				; Multiply the value by two.
+	rl	OP2_LSB
+	rl	OP2_MSB
+	add	JVM_PC_LSB,OP2_LSB	; Add to the PC.
+	snc
+	inc	JVM_PC_MSB
+	add	JVM_PC_MSB,OP2_MSB
+	call	@JVMGetOpcode		; Read the offset.
+	mov	OP3_MSB,w
+	call	@JVMGetOpcode
+	mov	OP3_LSB,w
+	; Drop through to do the jump.
+:offset
+	bank	JVMVars2
+	mov	OP_LSB,OP4_LSB
+	mov	w,OP4_MSB
+	bank	JVMVars
+	mov	JVM_PC_MSB,w		; Restore the PC.
+	mov	JVM_PC_LSB,OP_LSB
+	add	JVM_PC_LSB,OP3_LSB	; Add the offset.
+	snc
+	inc	JVM_PC_MSB
+	add	JVM_PC_MSB,OP3_MSB
+	NEXT_OP
+
+
+do_istore
+	mov	SRAMAddressLSB,w
+	mov	SRAMAddressMSB,JVM_FP_MSB
+	add	SRAMAddressLSB,JVM_FP_LSB	; Add the offset
+	snc
+	inc	SRAMAddressMSB
+	mov	w,OP_LSB	; Load the value again
+	call	@SRAMWrite	; Save to the SRAM.
+	DEC_SRAM_ADDRESS
+	mov	w,OP_MSB
+	call	@SRAMWrite
+	NEXT_OP
+
+do_iload
+	mov	SRAMAddressLSB,w
+	mov	SRAMAddressMSB,JVM_FP_MSB
+	add	SRAMAddressLSB,JVM_FP_LSB	; Add the offset
+	snc
+	inc	SRAMAddressMSB
+	call	@SRAMRead	; Read the byte.
+	mov	OP2_MSB,w	; Save it.
+	INC_SRAM_ADDRESS
+	call	@SRAMRead	; Read the byte.
+	mov	OP2_LSB,w	; Save it.
+	cje	JVM_OPCODE,#j_ret,:ret ; Was the instruction 'ret'?
+	call	@JVMPush2	; Push the word.
+	NEXT_OP
+:ret	mov	JVM_PC_MSB,OP2_MSB
+	mov	JVM_PC_LSB,OP2_LSB
+	NEXT_OP
+
+nm_jstamp_core_CPU_Carry
+	clr	OP_MSB
+	bank	JVMVars
+	clr	OP_LSB
+	snb	JVM_CARRY_FLAG
+	setb	OP_LSB.0
+	setz
+	retp
+
+nmNumWords		=	nmBlockBank + $0
+nmByte0			=	nmBlockBank + $2
+nmByte1			=	nmBlockBank + $3
+nmByte2			=	nmBlockBank + $4
+nmByte3			=	nmBlockBank + $5
+
+nm_jstamp_callback_ReturnTwo
+;	bank	JVMVars
+;	call	@JVMReturn		; Return three times: celsius.Callback.returnTwo
+;	call	@JVMReturn		; long method
+;	call	@JVMReturn		; celsius.Callback.callback
+;	; Now push the result back on the stack.
+;	bank	nmBlockBank
+;	mov	OP_MSB,nmByte0
+;	mov	OP_LSB,nmByte1
+;	mov	OP2_MSB,nmByte2
+;	mov	OP2_LSB,nmByte3
+;	cje	nmNumWords,#1,:oneresult
+;	bank	JVMVars
+;	call	@JVMPush
+;:oneresult
+;	bank	JVMVars
+;	call	@JVMPush2
+	NEXT_OP
+
+;-------------------------------------------------------------------------------
+; Subroutine: InitHeapMemory
+;
+; Initialise a portion of heap memory to 0. The start of the memory segment is
+; pointed to by JVM_SP_LSB. The memory is cleared to the end.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_InitHeapMemory
+	mov	SRAMAddressMSB,JVM_SP_MSB
+	mov	SRAMAddressLSB,JVM_SP_LSB
+:loop	mov	w,#0
+	call	@SRAMWrite
+	INC_SRAM_ADDRESS
+	cse	SRAMAddressMSB,#(kMemSize&$ff00)>>8
+	jmp	@:loop
+	cse	SRAMAddressLSB,#(kMemSize&$00ff)
+	jmp	@:loop
+:done	retp
+
+;--------------------------------------------------------------------------
+; Jump table start
+;--------------------------------------------------------------------------
+
+	org	$200
+JVMLoadOp
+	clr	wdt		; Clear the watchdog.
+;	setb	rc.0		; ## Timing
+
+	call	@JVMGetOpcode	; Get the next opcode
+
+;	clrb	rc.0		; ## Timing
+
+IF JVMDebug = 1
+	call	@DebuggerLoop	; Give the debugger a chance to run
+ENDIF
+	mov	JVM_OPCODE,w	; Save the opcode, just in case.
+
+JVMDoJump
+	add	PC,w		; Create a jump by adding the opcode to pc
+JVMJumpTable
+
+; Jem dispatch table.
+	jmp	l_j_nop	; $00
+	jmp	l_j_iconst_m1	; $01
+	jmp	l_j_iconst_0	; $02
+	jmp	l_j_iconst_1	; $03
+	jmp	l_j_iconst_2	; $04
+	jmp	l_j_iconst_3	; $05
+	jmp	l_j_iconst_4	; $06
+	jmp	l_j_iconst_5	; $07
+	jmp	l_j_bipush	; $08
+	jmp	l_j_sipush	; $09
+	jmp	l_j_iload	; $0A
+	jmp	l_j_iload_0	; $0B
+	jmp	l_j_iload_1	; $0C
+	jmp	l_j_iload_2	; $0D
+	jmp	l_j_iload_3	; $0E
+	jmp	l_j_istore	; $0F
+	jmp	l_j_istore_0	; $10
+	jmp	l_j_istore_1	; $11
+	jmp	l_j_istore_2	; $12
+	jmp	l_j_istore_3	; $13
+	jmp	l_j_ifeq	; $14
+	jmp	l_j_ifne	; $15
+	jmp	l_j_iflt	; $16
+	jmp	l_j_ifle	; $17
+	jmp	l_j_ifgt	; $18
+	jmp	l_j_ifge	; $19
+	jmp	l_j_if_icmpeq	; $1A
+	jmp	l_j_if_icmpne	; $1B
+	jmp	l_j_if_icmplt	; $1C
+	jmp	l_j_if_icmpge	; $1D
+	jmp	l_j_if_icmpgt	; $1E
+	jmp	l_j_if_icmple	; $1F
+	jmp	l_j_if_acmpeq	; $20
+	jmp	l_j_if_acmpne	; $21
+	jmp	l_j_ireturn	; $22
+	jmp	l_j_return	; $23
+	jmp	l_j_invokevirtual	; $24
+	jmp	l_j_invokestatic	; $25
+	jmp	l_j_getstatic	; $26
+	jmp	l_j_putstatic	; $27
+	jmp	l_j_pop	; $28
+	jmp	l_j_pop2	; $29
+	jmp	l_j_dup	; $2A
+	jmp	l_j_dup_x1	; $2B
+	jmp	l_j_dup_x2	; $2C
+	jmp	l_j_dup2	; $2D
+	jmp	l_j_dup2_x1	; $2E
+	jmp	l_j_dup2_x2	; $2F
+	jmp	l_j_swap	; $30
+	jmp	l_j_iadd	; $31
+	jmp	l_j_isub	; $32
+	jmp	l_j_ineg	; $33
+	nop
+	jmp	@_l_j_ior	; $35
+	jmp	@_l_j_ishl	; $37
+	jmp	@_l_j_ishr	; $39
+	jmp	@_l_j_iushr	; $3B
+	jmp	@_l_j_iand	; $3D
+	jmp	@_l_j_ixor	; $3F
+	jmp	@_l_j_i2b	; $41
+	jmp	@_l_j_goto	; $43
+	jmp	@_l_j_invokeinterface	; $45
+	jmp	@_l_j_arraylength	; $47
+	jmp	@_l_j_athrow	; $49
+	jmp	@_l_j_checkcast	; $4B
+	jmp	@_l_j_instanceof	; $4D
+	jmp	@_l_j_wide	; $4F
+	jmp	@_l_j_iinc	; $51
+	jmp	@_l_j_getfield	; $53
+	jmp	@_l_j_putfield	; $55
+	jmp	@_l_j_new	; $57
+	jmp	@_l_j_newarray	; $59
+	jmp	@_l_j_anewarray	; $5B
+	jmp	@_l_j_iaload	; $5D
+	jmp	@_l_j_iastore	; $5F
+	jmp	@_l_j_baload	; $61
+	jmp	@_l_j_bastore	; $63
+	jmp	@_l_j_ldc	; $65
+	jmp	@_l_j_ldc_w	; $67
+	jmp	@_l_j_ldc2_w	; $69
+	jmp	@_l_j_imul	; $6B
+	jmp	@_l_j_idiv	; $6D
+	jmp	@_l_j_irem	; $6F
+	jmp	@_l_j_jsr	; $71
+	jmp	@_l_j_ret	; $73
+	jmp	@_l_j_tableswitch	; $75
+	jmp	@_l_j_lookupswitch	; $77
+
+;--------------------------------------------------------------------------
+; Java opcode implementations
+;--------------------------------------------------------------------------
+
+
+l_j_iconst_m1
+	mov	w,#-1
+	mov	OP_LSB,w	; Load -1
+	mov	OP_MSB,w
+	call	@JVMPush	; Push onto the stack
+	NEXT_OP
+l_j_aconst_null			; Use zero for 'null'
+l_j_iconst_0
+	mov	w,#0
+	jmp	do_iconst
+l_j_iconst_1
+	mov	w,#1
+	jmp	do_iconst
+l_j_iconst_2
+	mov	w,#2
+	jmp	do_iconst
+l_j_iconst_3
+	mov	w,#3
+	jmp	do_iconst
+l_j_iconst_4
+	mov	w,#4
+	jmp	do_iconst
+l_j_iconst_5
+	mov	w,#5
+	jmp	do_iconst
+do_iconst
+	mov	OP_LSB,w
+	mov	w,#0
+	call	@JVMPushByte	; Push the MSB
+	mov	w,OP_LSB
+	call	@JVMPushByte	; Push the LSB
+	NEXT_OP
+
+l_j_i2s
+l_j_nop				; Do nothing
+	NEXT_OP
+
+l_j_astore_0
+l_j_istore_0
+	call	@JVMPop		; Pop value from stack
+	mov	w,#1		; Add 0 to point to local 0
+	jmp	@do_istore
+l_j_astore_1
+l_j_istore_1
+	call	@JVMPop		; Pop value from stack
+	mov	w,#3		; Add 2 to point to local 1
+	jmp	@do_istore
+l_j_astore_2
+l_j_istore_2
+	call	@JVMPop		; Pop value from stack
+	mov	w,#5		; Add 4 to point to local 2
+	jmp	@do_istore
+l_j_astore_3
+l_j_istore_3
+	call	@JVMPop		; Pop value from stack
+	mov	w,#7		; Add 6 to point to local 3
+	jmp	@do_istore
+l_j_astore
+l_j_istore
+	call	@JVMPop		; Pop value from stack
+	call	@JVMGetOpcode	; Get index of store
+	mov	SCRATCH0,w
+	clc			; Clear carry
+	rl	SCRATCH0	; Multiply index by two
+	inc	SCRATCH0
+	mov	w,SCRATCH0
+	jmp	@do_istore
+
+l_j_aload_0
+l_j_iload_0
+	mov	w,#0		; Add 0 to point to local 0
+	mov	SCRATCH0,w
+	jmp	@do_iload
+l_j_aload_1
+l_j_iload_1
+	mov	w,#2		; Add 2 to point to local 1
+	mov	SCRATCH0,w
+	jmp	@do_iload
+l_j_aload_2
+l_j_iload_2
+	mov	w,#4		; Add 4 to point to local 2
+	mov	SCRATCH0,w
+	jmp	@do_iload
+l_j_aload_3
+l_j_iload_3
+	mov	w,#6		; Add 6 to point to local 3
+	mov	SCRATCH0,w
+	jmp	@do_iload
+_l_j_ret
+l_j_aload
+l_j_iload
+	call	@JVMGetOpcode	; Get index of load
+	mov	SCRATCH0,w
+	clc			; Clear carry
+	rl	SCRATCH0	; Multiply index by two
+	mov	w,SCRATCH0
+	jmp	@do_iload
+
+l_j_isub
+	clrb	JVM_CARRY_FLAG
+	call	@DoSub		; Call the subtraction routine.
+	call	@JVMPush2	; Push back the result.
+	NEXT_OP
+l_j_iadd
+	clrb	JVM_CARRY_FLAG
+	call	@DoAdd		; Call the addition routine.
+	call	@JVMPush2	; Push back the result.
+	NEXT_OP
+
+l_j_bipush
+	call	@JVMGetOpcode	; Load the byte
+	mov	OP_LSB,w
+	rl	OP_LSB		; Perform sign extension.
+	mov	OP_MSB,#-1
+	sc
+	clr	OP_MSB
+	rr	OP_LSB
+	call	@JVMPush	; Push the value.
+	NEXT_OP
+
+l_j_sipush
+	call	@JVMGetOpcode	; Load the byte
+	mov	OP_MSB,w	; Put into MSB
+	call	@JVMGetOpcode	; Load the byte
+	mov	OP_LSB,w	; Pust into LSB
+	call	@JVMPush	; Push onto stack
+	NEXT_OP
+
+_l_j_jsr
+	mov	OP_MSB,JVM_PC_MSB	; Save the PC.
+	mov	OP_LSB,JVM_PC_LSB
+	add	OP_LSB,#2		; Add two to skip the operand.
+	snc
+	inc	OP_MSB
+	call	@JVMPush		; Push the PC.
+	; Fall through to do the jump.
+_l_j_goto
+	call	@JVMOffsetPC	; Unconditionally change the PC
+	NEXT_OP
+
+l_j_if_acmpeq
+l_j_if_acmpne
+l_j_if_icmple
+l_j_if_icmpgt
+l_j_if_icmpge
+l_j_if_icmpeq
+l_j_if_icmpne
+l_j_if_icmplt			; Branch if value1 < value2
+	jmp	@Condition
+
+l_j_ifnull
+	mov	JVM_OPCODE,#j_ifeq
+	jmp	l_j_ifeq
+
+l_j_ifnonnull
+	mov	JVM_OPCODE,#j_ifne
+	jmp	l_j_ifne
+
+l_j_ifeq
+l_j_ifne
+l_j_ifge
+l_j_ifgt
+l_j_ifle
+l_j_iflt
+	call	@JVMPop2	; Pop the value.
+	jmp	@ConditionZero
+
+l_j_dup
+	call	@JVMPop		; Pop the top of the stack.
+	call	@JVMPush	; Push it back twice.
+	call	@JVMPush
+	NEXT_OP
+l_j_dup2
+	call	@JVMPop
+	call	@JVMPop2
+	call	@JVMPush2
+	call	@JVMPush
+	call	@JVMPush2
+	call	@JVMPush
+	NEXT_OP
+l_j_dup_x1
+	call	@JVMPop
+	call	@JVMPop2
+	call	@JVMPush
+	call	@JVMPush2
+	call	@JVMPush
+	NEXT_OP
+
+l_j_pop
+	sub	JVM_SP_LSB,#2	; Just ignore the value by decrementing the SP.
+	sc
+	dec	JVM_SP_MSB
+	NEXT_OP
+l_j_pop2
+	sub	JVM_SP_LSB,#4
+	sc
+	dec	JVM_SP_MSB
+	NEXT_OP
+
+l_j_ineg			; Equivalent to (~x)+1
+	call	@JVMPop
+	not	OP_MSB
+	not	OP_LSB
+	inc	OP_LSB
+	snz
+	inc	OP_MSB
+	call	@JVMPush
+	NEXT_OP
+
+l_j_swap
+	call	@JVMPop
+	call	@JVMPop2
+	call	@JVMPush
+	call	@JVMPush2
+	NEXT_OP
+
+l_j_invokevirtual
+	call	@JVMEnterVirtualMethod
+	call	@JVMCheckMemory	; Check for memory overflow.
+	NEXT_OP
+
+l_j_invokestatic
+	call	@JVMEnterMethod	; Check for memory overflow.
+	call	@JVMCheckMemory
+	NEXT_OP
+
+l_j_ireturn			; Return from a function
+	call	@JVMPop		; Pop the return value
+	call	@JVMReturnVal	; Return with a value.
+	NEXT_OP
+
+l_j_return
+	call	@JVMReturn	; Return without a value.
+	NEXT_OP
+
+l_j_getstatic
+	bank	JVMVars2
+	mov	OP_MSB,JVM_SF_MSB
+	mov	OP_LSB,JVM_SF_LSB
+	bank	JVMVars
+	jmp	@_do_getfield
+
+l_j_putstatic
+	call	@JVMPop2		; Pop the value from the stack.
+	bank	JVMVars2
+	mov	OP_MSB,JVM_SF_MSB
+	mov	OP_LSB,JVM_SF_LSB
+	bank	JVMVars
+	jmp	@_do_putfield
+
+_l_j_instanceof
+	call	@JVMGetOpcode		; Read the type to check against.
+	mov	OP2_MSB,w
+	call	@JVMGetOpcode
+	mov	OP2_LSB,w
+	call	@JVMPop		; Pop the object reference
+	call	@JVMCheckObject		; Check the object is non-null.
+	mov	SRAMAddressMSB,OP_MSB	; Point to the class pointer.
+	mov	SRAMAddressLSB,OP_LSB
+	call	@SRAMRead		; Read the MSB.
+	mov	OP_MSB,w
+	INC_SRAM_ADDRESS
+	call	@SRAMRead		; Read the LSB.
+	mov	OP_LSB,w
+	call	@instanceof_internal	; Check for a match.
+	NEXT_OP
+
+_l_j_checkcast
+	call	@JVMGetOpcode	; Load the byte
+	call	@JVMGetOpcode	; Load the byte
+	NEXT_OP
+
+_l_j_irem
+	call	@DoDiv
+	sb	JVM_NEG_FLAG
+	jmp	:no_neg
+	not	OP3_LSB          ; negate rem
+	inc	OP3_LSB
+	snz
+	dec	OP3_MSB
+	not	OP3_MSB
+:no_neg
+	mov	w,OP3_MSB
+	call	@JVMPushByte
+	mov	w,OP3_LSB
+	call	@JVMPushByte
+	NEXT_OP
+
+
+_l_j_idiv
+		; 16 bit by 16 bit division (b/a) OP_?SB = b, OP2_?SB = a
+		; entry: 16 bit b, 16 bit a
+		; exit : result in b, remainder in remainder
+	call	@DoDiv
+	call	@JVMPush
+	NEXT_OP
+
+	l_j_dup_x2	; $2D
+	l_j_dup2_x1	; $2F
+	l_j_dup2_x2	; $30
+
+	_l_j_invokeinterface	; $5E
+	_l_j_wide	; $66
+
+	_l_j_ldc2_w
+
+UnknownOpcode
+IF JVMDebug
+	jmp	@DebugUnknownOpcode
+ENDIF
+
+
+_DoDiv
+	call	@JVMPop2
+	call	@JVMPop
+
+; ( ACCb/ACCa -> ACCb with remainder in ACCc )
+	mov	w,OP2_MSB
+	xor	w,OP_MSB
+	clr	SCRATCH0
+	sb	OP_MSB.7        ; if MSB set go & negate ACCb
+	jmp	:checka
+	setb	SCRATCH0.0
+	not	OP_LSB          ; negate ACCb
+	inc	OP_LSB
+	snz
+	dec	OP_MSB
+	not	OP_MSB
+:checka	sb	OP2_MSB.7       ; if MSB set go & negate ACCa
+	jmp	:start
+:nega 	
+	cse	JVM_OPCODE,#j_irem
+	not	SCRATCH0
+	not	OP2_LSB       ; negate ACCa ( -ACCa -> ACCa )
+	inc	OP2_LSB
+	snz
+	dec	OP2_MSB
+	not	OP2_MSB
+:start
+	movb	JVM_NEG_FLAG,SCRATCH0.0	; 4	save the sign.
+	mov	JVM_opcode,#16 		; 2	no. of time to shift
+	mov	Scratch0,OP_LSB		; 2	move b to make space
+	mov	Scratch1,OP_MSB		; 2	for result
+	clr	OP_LSB			; 1	clear the result fields
+	clr 	OP_MSB			; 1	one more byte
+	clr	OP3_LSB			; 1	clear remainder low byte
+	clr	OP3_MSB			; 1	clear remainder high byte
+:divloop
+	clc				; 1	clear carry before shift
+	rl	Scratch0		; 1	check the dividend
+	rl	Scratch1		; 1	bit by bit
+	rl	OP3_LSB			; 1	put it in the remainder for
+	rl	OP3_MSB			; 1	trial subtraction
+						; subtotal=5
+	stc				; 1	prepare for subtraction, no borrow
+	mov	w,OP2_MSB		; 1	do trial subtraction
+	mov	w,OP3_MSB-w		; 1	from MSB first
+	sz				; 1/2	if two MSB equal, need to check LSB
+	jmp	:chk_carry		; 3	not equal, check which one is bigger
+						;
+		; if we are here, then z=1, so c must be 1 too, since there is no
+		; underflow, so we save a stc instruction
+
+	mov	w,OP2_LSB		; 1	equal MSB, check LSB
+	mov	w,OP3_LSB-w		; 1	which one is bigger?
+						; subtotal=7
+:chk_carry
+	sc				; 1/2	partial dividend >a?
+	jmp	:shft_quot		; 3	no, partial dividend < a, set a 0 into quotient
+
+		; if we are here, then c must be 1, again, we save another stc instruction
+
+					; yes, part. dividend > a, subtract a from it
+	sub	OP3_LSB,OP2_LSB		; 2	store part. dividend-a into a
+	sc
+	dec	OP3_MSB
+	sub	OP3_MSB,OP2_MSB			; 2	2 bytes
+	stc				; 1	shift a 1 into quotient
+						; subtotal=7 worst case
+:shft_quot
+	rl	OP_LSB			; 1	store into result
+	rl	OP_MSB			; 1	16 bit result, thus 2 rotates
+	decsz	JVM_opcode			; 1/2
+	jmp	:divloop		; 3
+
+	sb	JVM_NEG_FLAG
+	retp
+	not	OP_LSB          ; negate ACCb
+	inc	OP_LSB
+	snz
+	dec	OP_MSB
+	not	OP_MSB
+	retp
+
+
+	org	$402
+
+ProcInit	jmp	@_ProcInit
+IOInit		jmp	@_IOInit
+JVMInit		jmp	@_JVMInit
+RAMInit		jmp	@_RAMInit
+
+; Condition opcodes: if_icmp<cond>, if_acmp<cond>, if<cond>
+; These are handled by first computing the sign of the condition value
+; using common code for all conditions. A jump table then chooses the
+; appropriate condition code.
+; This code must be in the first half of a page.
+Condition
+	; First compute value1 - value2
+	call	@DoSub		; Call the subtraction routine.
+ConditionZero
+	; Compress the result into one byte.
+	test	OP2_LSB
+	sz
+	setb	OP2_MSB.0
+	test	OP2_MSB
+	sz
+	setb	OP2_MSB.0
+
+;MSB.0 is set if not zero
+;MSB.0 is clear if zero
+
+	; Jump based on the condition type.
+	mov	w,#j_ifeq
+	mov	w,JVM_OPCODE-w	; Make all <cond> opcodes relative to zero.
+	page	$
+	add	PC,w
+	jmp	:ifeq
+	jmp	:ifne
+	jmp	:iflt
+	jmp	:ifle
+	jmp	:ifgt
+	jmp	:ifge
+	jmp	:ifeq
+	jmp	:ifne
+	jmp	:iflt
+	jmp	:ifge
+	jmp	:ifgt
+	jmp	:ifle
+	jmp	:ifeq
+	jmp	:ifne
+:ifeq
+	sb	OP2_MSB.0	; Is the value zero?
+	jmp	:branch		; Yes, take the branch.
+	jmp	:noBranch	; No, don't take the branch.
+:ifne
+	snb	OP2_MSB.0	; Is the value zero?
+	jmp	:branch		; No, take the branch.
+	jmp	:noBranch	; Yes, don't take the branch.
+:iflt
+	snb	OP2_MSB.7	; Is the sign bit set?
+	jmp	:branch		; Yes, take the branch.
+	jmp	:noBranch	; No, don't take the branch.
+:ifge
+	sb	OP2_MSB.7	; Is the sign bit set?
+	jmp	:branch		; No, take the branch.
+	jmp	:noBranch	; Yes, don't take the branch.
+:ifgt
+	snb	OP2_MSB.7	; Is the sign bit set?
+	jmp	:nobranch	; Yes, don't branch
+	snb	OP2_MSB.0	; Is the value zero?
+	jmp	:Branch		; No, take the branch.
+	jmp	:noBranch	; Yes, don't take the branch.
+:ifle
+	snb	OP2_MSB.7	; Is the sign bit set?
+	jmp	:branch		; Yes, take the branch.
+	sb	OP2_MSB.0	; Is the value zero?
+	jmp	:branch		; Yes, take the branch branch.
+	jmp	:noBranch	; No, don't take the branch.
+
+:branch
+
+	call	@JVMOffsetPC	; Do the branch.
+	NEXT_OP
+:noBranch
+	ADD_PC	2
+	NEXT_OP
+
+_l_j_ixor
+	call	@JVMPop2
+	call	@JVMPop		; Pop the second value from the stack.
+	xor	OP2_LSB,OP_LSB	; xor the LSB
+	xor	OP2_MSB,OP_MSB	; xor the MSB
+	call	@JVMPush2
+	NEXT_OP
+
+_l_j_iand
+	call	@JVMPop2
+	call	@JVMPop		; Pop the second value from the stack.
+	and	OP2_LSB,OP_LSB	; xor the LSB
+	and	OP2_MSB,OP_MSB	; xor the MSB
+	call	@JVMPush2
+	NEXT_OP
+
+_l_j_ior
+	call	@JVMPop2
+	call	@JVMPop		; Pop the second value from the stack.
+	or	OP2_LSB,OP_LSB	; xor the LSB
+	or	OP2_MSB,OP_MSB	; xor the MSB
+	call	@JVMPush2
+	NEXT_OP
+
+_l_j_ishr
+	call	@JVMPop2	; Get the number of bits to shift by.
+	call	@JVMPop		; Get the number to shift.
+	and	OP2_LSB,#$1f	; Use only lower 5 bits.
+	test	OP2_LSB
+:loop	snz
+	jmp	:done
+	setb	c
+	sb	OP_MSB.7
+	clc
+	rr	OP_MSB		; Rotate right one bit.
+	rr	OP_LSB		; Rotate into the LSB
+	dec	OP2_LSB
+	jmp	:loop
+:done	call	@JVMPush
+	NEXT_OP
+
+_l_j_iushr
+	call	@JVMPop2	; Get the number of bits to shift by.
+	call	@JVMPop		; Get the number to shift.
+	and	OP2_LSB,#$1f	; Use only lower 5 bits.
+	test	OP2_LSB
+:loop	snz
+	jmp	:done
+	clc
+	rr	OP_MSB		; Rotate right one bit.
+	rr	OP_LSB		; Rotate into the LSB
+	dec	OP2_LSB
+	jmp	:loop
+:done	call	@JVMPush
+	NEXT_OP
+
+_l_j_ishl
+	call	@JVMPop2	; Get the number of bits to shift by.
+	call	@JVMPop		; Get the number to shift.
+	and	OP2_LSB,#$1f	; Use only lower 5 bits.
+	test	OP2_LSB
+:loop	snz
+	jmp	:done
+	clc
+	rl	OP_LSB		; Rotate right one bit.
+	rl	OP_MSB		; Rotate into the LSB
+	dec	OP2_LSB
+	jmp	:loop
+:done	call	@JVMPush
+	NEXT_OP
+
+_l_j_arraylength
+	call	@JVMPop		; Pop the object pointer.
+	add	OP_LSB,#2	; Skip over the class pointer.
+	snc
+	inc	OP_MSB
+	mov	SRAMAddressMSB,OP_MSB
+	mov	SRAMAddressLSB,OP_LSB
+	call	@SRAMRead	; Read the MSB.
+	mov	OP_MSB,w
+	INC_SRAM_ADDRESS
+	call	@SRAMRead	; Read the LSB.
+	mov	OP_LSB,w
+	call	@JVMPush	; Push the length onto the stack.
+	NEXT_OP
+
+_l_j_iinc
+	call	@JVMGetOpcode	; Get index of local variable
+	mov	SCRATCH0,w
+	call	@JVMGetOpcode
+	mov	OP_LSB,w	; Save the increment amount.
+	mov	w,#-1		; Do sign extension.
+	sb	OP_LSB.7
+	mov	w,#0
+	mov	OP_MSB,w
+	setb	c		; Set carry to add one.
+	rl	SCRATCH0	; Multiply index by two (and add one).
+	mov	SRAMAddressMSB,JVM_FP_MSB
+	mov	w,SCRATCH0
+	add	w,JVM_FP_LSB	; Add the frame pointer into W
+	snc
+	inc	SRAMAddressMSB
+	mov	SRAMAddressLSB,w
+	mov	OP2_MSB,#0
+	call	@SRAMRead
+	mov	OP2_LSB,w
+	DEC_SRAM_ADDRESS
+	call	@SRAMRead
+	mov	OP2_MSB,w
+	add	OP2_LSB,OP_LSB	; Add the two LSBs.
+	snc			; Did a carry occur?
+	inc	OP2_MSB		; Yes.
+	add	OP2_MSB,OP_MSB	; Add the MSBs.
+	mov	w,OP2_MSB
+	call	@SRAMWrite
+	INC_SRAM_ADDRESS
+	mov	w,OP2_LSB
+	call	@SRAMWrite
+	NEXT_OP
+
+
+_DoSub			; Subtraction is addition of the negative.
+	call	@JVMPop		; Pop the first operand.
+	not	OP_LSB		; Negate the LSB
+	inc	OP_LSB		; Increment
+	snz			; Is it zero?
+	dec	OP_MSB		; Yes, decrement the MSB.
+	not	OP_MSB		; Negate the MSB.
+	jmp	sub_entry	; Jump into the addition routine.
+_DoAdd
+	call	@JVMPop		; Pop the first operand.
+sub_entry
+	call	@JVMPop2	; Pop the second operand.
+	add	OP2_LSB,OP_LSB	; Add the two LSBs.
+	jnc	:nc		; Did a carry occur?
+	inc	OP2_MSB		; Yes.
+	snz
+	setb	JVM_CARRY_FLAG	; Set the carry flag.
+:nc	add	OP2_MSB,OP_MSB	; Add the MSBs.
+	snc
+	setb	JVM_CARRY_FLAG
+	retp
+
+_l_j_anewarray
+	INC_PC			; We don't care about the type so ignore it.
+_l_j_newarray
+	call	@JVMGetOpcode	; Read the type
+	mov	SCRATCH0,w
+	call	@JVMPop		; Get the size of the array off the stack.
+	mov	OP2_LSB,OP_LSB
+	mov	OP2_MSB,OP_MSB
+	snb	SCRATCH0.0	; Check the low bit of the type.
+	jmp	:bytearray
+	clc
+	rl	OP2_LSB		; Multiply the number of elements by two.
+	rl	OP2_MSB
+:bytearray			; Don't multiply by 2 for byte arrays
+	add	OP2_LSB,#4	; Make space for the class pointer and length.
+	snc
+	inc	OP2_MSB
+	; Allocate a new pointer for the class.
+	sub	JVM_HP_LSB,OP2_LSB	; Subtract the length from the heap pointer.
+	sc
+	dec	JVM_HP_MSB
+	sub	JVM_HP_MSB,OP2_MSB
+	call	@JVMCheckMemory	; Check for memory overflow.
+	mov	SRAMAddressMSB,JVM_HP_MSB
+	mov	SRAMAddressLSB,JVM_HP_LSB
+	bank	OffsetVars
+	mov	w,JVM_Object_MSB
+	bank	JVMVars
+	call	@SRAMWrite	; Save the Object class pointer (MSB).
+	INC_SRAM_ADDRESS
+	bank	OffsetVars
+	mov	w,JVM_Object_LSB
+	bank	JVMVars
+	call	@SRAMWrite	; Save the Object class pointer (LSB).
+	INC_SRAM_ADDRESS
+	mov 	w,OP_MSB
+	call	@SRAMWrite	; Save the length MSB.
+	INC_SRAM_ADDRESS
+	mov 	w,OP_LSB
+	call	@SRAMWrite	; Save the length LSB.
+	mov	OP_MSB,JVM_HP_MSB
+	mov	OP_LSB,JVM_HP_LSB
+	call	@JVMPush	; Push the array pointer onto the stack.
+	NEXT_OP
+
+_l_j_new
+	call	@JVMGetOpcode	; Load the MSB of the class offset.
+	mov	OP_MSB,w	; Save
+	call	@JVMGetOpcode	; Load the LSB of the class offset.
+	mov	OP_LSB,w
+	call	@do_new
+	NEXT_OP
+
+; On entry OP_?SB contains the class offset.
+; On exit OP_?SB contains the new object.
+_do_new
+	mov	OP3_MSB,JVM_PC_MSB	; Save the program counter.
+	mov	OP3_LSB,JVM_PC_LSB
+	mov	JVM_PC_MSB,OP_MSB
+	mov	JVM_PC_LSB,OP_LSB
+	add	JVM_PC_LSB,#2	; Skip over the superclass pointer.
+	snc
+	inc	JVM_PC_MSB
+	call	@JVMGetOpcode	; Read the size of non-static fields in the class.
+	; Allocate a new pointer for the class.
+	mov	OP2_LSB,w
+	add	OP2_LSB,#2		; Add two to the fields size for the class pointer.
+	sub	JVM_PC_LSB,#3		; Subtract three for the size of the superclass pointer.
+	sc
+	dec	JVM_PC_MSB
+	sub	JVM_HP_LSB,OP2_LSB	; Subtract the size of the fields from the heap pointer.
+	sc
+	dec	JVM_HP_MSB
+	call	@JVMCheckMemory	; Check for memory overflow.
+	mov	SRAMAddressMSB,JVM_HP_MSB	; Point to the object
+	mov	SRAMAddressLSB,JVM_HP_LSB
+	mov	w,JVM_PC_MSB	; Save the class pointer MSB.
+	call	@SRAMWrite
+	INC_SRAM_ADDRESS
+	mov	w,JVM_PC_LSB	; Save the class pointer LSB.
+	call	@SRAMWrite
+	; Push the new pointer into the stack.
+	mov	OP_MSB,JVM_HP_MSB
+	mov	OP_LSB,JVM_HP_LSB
+	call	@JVMPush
+	mov	JVM_PC_MSB,OP3_MSB	; Retrieve the program counter.
+	mov	JVM_PC_LSB,OP3_LSB
+	retp
+
+_l_j_ldc_w
+	INC_PC
+_l_j_ldc
+	; Currently LDC is only used to instantiate strings.
+	call	@JVMGetOpcode	; Read the string index.
+	mov	Scratch0,w
+	clc
+	rl	Scratch0	; Multiply the index by two.
+	bank	OffsetVars
+	mov	OP_LSB,JVM_STable_LSB
+	mov	w,JVM_STable_MSB
+	bank	JVMVars
+	mov	SRAMAddressMSB,w
+	mov	SRAMAddressLSB,OP_LSB
+	add	SRAMAddressLSB,Scratch0
+	snc
+	inc	SRAMAddressMSB		; We are now pointing at the index entry.
+	call	@SRAMRead
+	mov	OP_MSB,w	; Read the string array pointer.
+	INC_SRAM_ADDRESS
+	call	@SRAMRead
+	mov	OP_LSB,w
+	call	@JVMPush	; Push the string pointer.
+	NEXT_OP
+
+_l_j_imul
+	call	@JVMPop
+	call	@JVMPop2
+	mov	Scratch0,#17		; 2	set number of times to shift
+	clr	OP3_LSB			; 1	clear upper product
+	clr	OP3_MSB			; 1	higher byte of the 16 bit upeper product
+	clc				; 1	clear carry
+						; the following are executed [count] times
+:m1616loop
+	rr	OP3_MSB			; 1	rotate right the whole product
+	rr	OP3_LSB			; 1 	lower byte of the 16 bit upper product
+	rr	OP2_MSB			; 1	high byte of the multiplier
+	rr	OP2_LSB			; 1	check lsb
+	sc				; 1	skip addition if no carry
+
+	jmp	:no_add			; 3     no addition since lsb=0
+	clc				; 1	clear carry
+	add	OP3_LSB,OP_LSB		; 1	add multiplicand to upper product
+	snc
+	inc	OP3_MSB
+	add	OP3_MSB,OP_MSB		; 1	add the next 16 bit of multiplicand
+:no_add	decsz	Scratch0		; 1/2	loop [count] times to get proper product
+	jmp	:m1616loop		; 3	jmp to rotate the next half of product
+	call	@JVMPush2
+	NEXT_OP
+
+_l_j_lookupswitch
+	call	@JVMPop			; Pop the value.
+	mov	OP2_MSB,JVM_PC_MSB	; Load the PC.
+	mov	OP2_LSB,JVM_PC_LSB
+	call	@JVMPush2		; Save it on the stack.
+	call	@JVMGetOpcode		; Read the default jump offset.
+	mov	OP3_MSB,w		; Save it.
+	call	@JVMGetOpcode
+	mov	OP3_LSB,w
+	call	@JVMGetOpcode		; Read the number of pairs.
+	mov	OP2_MSB,w		; Save it.
+	call	@JVMGetOpcode
+	mov	OP2_LSB,w
+:loop	call	@JVMGetOpcode		; Read MSB of value.
+	mov	w,OP_MSB-w		; Compare to the case's MSB
+	sz				; Are they the same
+	jmp	:next3			; No.
+	call	@JVMGetOpcode		; Read the LSB of the value.
+	mov	w,OP_LSB-w		; Compare to the case's LSB
+	snz
+	jmp	:offset			; Found a match.
+	jmp	:next2
+:next3	call	@JVMGetOpcode
+:next2	call	@JVMGetOpcode
+	call	@JVMGetOpcode
+	decsz	OP2_LSB
+	jmp	:loop
+	test	OP2_MSB
+	snz
+	jmp	:default
+	dec	OP2_MSB
+	jmp	:loop
+:offset	call	@JVMGetOpcode
+	mov	OP3_MSB,w
+	call	@JVMGetOpcode
+	mov	OP3_LSB,w
+:default
+	call	@JVMPop			; Pop the PC back off the stack.
+	mov	JVM_PC_MSB,OP_MSB	; Restore the PC.
+	mov	JVM_PC_LSB,OP_LSB
+	add	JVM_PC_LSB,OP3_LSB	; Add the offset.
+	snc
+	inc	JVM_PC_MSB
+	add	JVM_PC_MSB,OP3_MSB
+	NEXT_OP
+
+org	$600
+
+_l_j_athrow
+	; Catching an exception works as follows:
+	; 1. Does the method define a handler table?
+	; 2.   If No => Unwind the stack one level. Goto 1.
+	; 3.   If Yes =>
+	; 4.   For each handler
+	; 5.     Does the caught class match the thrown class?
+	; 6.       If Yes => Jump to the catch routine.
+	; 7.       If No =>
+	; 8.         Does any superclass of the thrown class match?
+	; 6.           If Yes => Jump to the catch routine.
+	; 7.           If No => Unwind the stack one level. Goto 1.
+	;
+	; If the stack is completely unwound, signal an uncaught exception to the IDE.
+	; Be VERY careful with banks in this routine.
+
+	; Pop the exception object to throw.
+	; ## If this object is null then NullPointerException should be thrown.
+	call	@JVMPop			; Pop the exception object.
+	snb	JVM_ESET_FLAG
+	jmp	:keep_pc
+ 	mov	OP2_MSB,JVM_PC_MSB
+	mov	w,JVM_PC_LSB
+	bank	ExceptionVars
+	mov	JVM_TPC_LSB,w
+	mov	JVM_TPC_MSB,OP2_MSB
+:keep_pc
+	bank	ExceptionVars
+	mov	JVM_EObject_MSB,OP_MSB	; Save the exception object.
+	mov	JVM_EObject_LSB,OP_LSB
+	bank	JVMVars
+	mov	SRAMAddressLSB,OP_LSB	; Point to the object
+	mov	SRAMAddressMSB,OP_MSB	;
+	call	@SRAMRead		; Read the class header MSB.
+	mov	OP2_MSB,w		; Save it.
+	INC_SRAM_ADDRESS		; Point to the LSB.
+	call	@SRAMRead		; Read the class header LSB.
+	bank	ExceptionVars
+	mov	JVM_EType_LSB,w
+	mov	JVM_EType_MSB,OP2_MSB
+	bank	JVMVars
+
+	; (1) Check if there is a handler table.
+:checkTable
+	mov	EEAddressMSB, JVM_Method_MSB	; Point to the method.
+	mov	EEAddressLSB, JVM_Method_LSB
+	call	@JVMEERead		; Read the number of parameters (and exception flag).
+	mov	SCRATCH0,w
+	sb	SCRATCH0.7		; Is the exception bit set?
+	jmp	:unwindStack		; (2) No catch handler. Unwind the stack.
+	; Save the PC that the exception occured at.
+	mov	JVM_EPC_MSB,JVM_PC_MSB
+	mov	JVM_EPC_LSB,JVM_PC_LSB
+	mov	JVM_PC_MSB,JVM_METHOD_MSB	; Point to the method.
+	mov	JVM_PC_LSB,JVM_METHOD_LSB
+	add	JVM_PC_LSB,#5		; Skip over the number of parameters.
+	snc
+	inc	JVM_PC_MSB
+	call	@JVMGetOpcode
+	mov	SCRATCH0,w
+	call	@JVMGetOpcode
+	mov	JVM_PC_LSB,w
+	mov	JVM_PC_MSB,SCRATCH0	; Point to the exception table.
+	call	@JVMGetOpcode		; Read the number of handlers. (Must be at least 1.)
+	bank	ExceptionVars
+	mov	JVM_ECount,w		; Save it.
+:handlerLoop
+	bank	JVMVars			; Loop for each handler.
+	; Check the PC >= start_pc
+	call	@JVMGetOpcode		; Read the MSB of the start PC.
+	mov	Scratch0,w
+	mov	w,JVM_EPC_MSB-w		; abort if JVM_EPC_MSB < start_pc_MSB
+	clr	SCRATCH0
+	sc
+	jmp	:next7
+	call	@JVMGetOpcode		; Read the LSB of the start PC.
+	mov	w,JVM_EPC_LSB-w		; abort if JVM_EPC_LSB < start_pc_LSB
+	snc
+	jmp	:endpc
+	cjne	JVM_EPC_MSB,Scratch0,:endpc	; Check if JVM_EPC_MSB = start_pc_MSB
+	clr	SCRATCH0
+	jmp	:next6
+	; Check the PC < end_pc
+:endpc	call	@JVMGetOpcode		; Read the MSB of the end PC.
+	mov	w,JVM_EPC_MSB-w		; abort if !(JVM_EPC_MSB <= end_pc_MSB)
+	sc
+	jmp	:ok
+	snz
+	jmp	:checkLSB
+	clr	SCRATCH0
+	jmp	:next5
+:ok
+	INC_PC
+	jmp	:doType
+:checkLSB
+	call	@JVMGetOpcode		; Read the LSB of the end PC.
+	mov	w,JVM_EPC_LSB-w		; abort if JVM_EPC_LSB >= end_pc_LSB
+	clr	SCRATCH0
+	snc
+	jmp	:next4
+:doType	call	@JVMGetOpcode		; Read the MSB of the catch type.
+	mov	OP2_MSB,w		; Save in OP2_?SB
+	call	@JVMGetOpcode		; Read the LSB of the catch type.
+	mov	OP2_LSB,w		; Save in OP2_?SB
+	bank	ExceptionVars
+	mov	OP_MSB,JVM_EType_MSB
+	mov	OP_LSB,JVM_EType_LSB
+	bank	JVMVars
+	call	instanceof_internal	; Check that it is an instance.
+	call	@JVMPop			; Pop the result
+
+	; This nop is to get around a suspected silicon bug. I have no idea
+	; why it is needed. If it is not here then the snz instruction in the jz
+	; below does not work consistently.
+	nop
+
+	test	OP_LSB
+	jz	:next2
+:caught
+	; We have found a valid handler.
+	bank	JVMVars
+	clrb	JVM_ESET_FLAG
+	call	@JVMGetOpcode		; Read the MSB of the catch handler offset.
+	mov	SCRATCH0,w		; Save it.
+	call	@JVMGetOpcode		; Read the LSB of the catch handler offset.
+	mov	JVM_PC_LSB,w		; Set the PC to the catch handler.
+	mov	JVM_PC_MSB,SCRATCH0
+	bank	ExceptionVars
+	mov	OP_MSB,JVM_EObject_MSB	; Restore the exception object.
+	mov	OP_LSB,JVM_EObject_LSB
+	bank	JVMVars
+	call	@JVMPush
+	NEXT_OP				; Read the next opcode.
+
+:next7	inc	SCRATCH0
+:next6	inc	SCRATCH0
+:next5	inc	SCRATCH0
+:next4	inc	SCRATCH0
+:next3	inc	SCRATCH0
+:next2	inc	SCRATCH0
+:next1	inc	SCRATCH0
+	add	JVM_PC_LSB,SCRATCH0
+	snc
+	inc	JVM_PC_MSB
+:nextHandler
+	bank	ExceptionVars
+	decsz	JVM_ECount		; Loop again.
+	jmp	:handlerLoop
+	bank	JVMVars
+	; The exception wasn't caught. Unwind the stack.
+:unwindStack
+	; Use the method pointer and frame pointer to unravel the stack frame.
+	mov	JVM_SP_MSB,JVM_FP_MSB	; Make the stack pointer point to the frame.
+	mov	JVM_SP_LSB,JVM_FP_LSB
+	mov	JVM_PC_MSB,JVM_METHOD_MSB	; Point to the method stub
+	mov	JVM_PC_LSB,JVM_METHOD_LSB
+	call	@JVMGetOpcode		; Read the number of parameters.
+	and	w,#%01111111		; Remove exception flag.
+	mov	SCRATCH0,w		; Save the number of parameters.
+	call	@JVMGetOpcode		; Read the number of locals.
+	add	SCRATCH0,w		; Add them together.
+	mov	w,#6			; Add in the pointers size.
+	add	w,SCRATCH0		; Add in the saved pointers
+	add	JVM_SP_LSB,w		; Point to the saved pointers.
+	snc
+	inc	JVM_SP_MSB
+	call	@JVMPop			; Pop the PC.
+	mov	JVM_PC_MSB,OP_MSB
+	mov	JVM_PC_LSB,OP_LSB
+	call	@JVMPop2		; Pop the frame pointer.
+	call	@JVMPop			; Pop the method pointer.
+	mov	JVM_METHOD_MSB,OP_MSB
+	mov	JVM_METHOD_LSB,OP_LSB
+	mov	JVM_SP_MSB,JVM_FP_MSB	; The stack pointer becomes the old frame pointer.
+	mov	JVM_SP_LSB,JVM_FP_LSB
+	mov	JVM_FP_MSB,OP2_MSB
+	mov	JVM_FP_LSB,OP2_LSB
+	; Check if we are at the bottom of the stack.
+	test	JVM_FP_LSB
+	sz
+	jmp	:checkTable
+	test	JVM_FP_MSB
+	sz
+	jmp	:checkTable		; Loop again.
+unhandledException
+	; Send a message to the debugger.
+	mov	w,#errException		; Indicate an unhandled exception.
+	call	@DebugStartMessage
+	bank	ExceptionVars
+	mov	w,JVM_EType_MSB
+	call	@DebugSendByte
+	bank	ExceptionVars
+	mov	w,JVM_EType_LSB
+	call	@DebugSendByte
+	bank	ExceptionVars
+	mov	w,JVM_TPC_MSB
+	call	@DebugSendByte
+	bank	ExceptionVars
+	mov	w,JVM_TPC_LSB
+	call	@DebugSendByte
+	call	@DebugEndMessage
+	jmp	@_JVMEndProgram
+
+; OP2_?SB contains the type to check.
+; OP_?SB contains the class reference to check against.
+instanceof_internal
+:checkType				; Check if the type matches the throw object.
+	cjne	OP_MSB,OP2_MSB,:nextType
+	cjne	OP_LSB,OP2_LSB,:nextType
+:caught					; We have found a match
+	mov	OP_LSB,#1
+	clr	OP_MSB
+	call	@JVMPush
+	retp
+:nextType
+:doNext
+	; Check the superclass for a match.
+	mov	EEAddressMSB,OP_MSB
+	mov	EEAddressLSB,OP_LSB
+	call	@JVMEERead		; Read the MSB of the superclass.
+	mov	OP_MSB,w
+	clr	SCRATCH0
+	cje	OP_MSB,#$FF,:nomatch	 ; If the superclass is -1 there is no match.
+	INC_EE_ADDRESS
+	call	@JVMEERead		; Read the LSB of the superclass.
+	mov	OP_LSB,w
+	cjne	OP_LSB,OP2_LSB,:doNext	; Compare the catch type and superclass.
+	cje	OP_MSB,OP2_MSB,:caught	; We caught the exception with a superclass.
+	jmp	:doNext
+:nomatch				; No match was found.
+	clr	OP_LSB
+	clr	OP_MSB
+	call	@JVMPush
+	retp
+
+_l_j_putfield
+	call	@JVMPop2	; Pop the value from the stack.
+	call	@JVMPop		; Pop the object.
+
+_do_putfield
+	call	@JVMCheckObject
+	call	@JVMGetOpcode	; Get the MSB of the field offset.
+	mov	SCRATCH0,w
+	call	@JVMGetOpcode	; Get the LSB of the field offset
+	add	OP_LSB,w	; Add it to the object offset.
+	snc			; Did a carry occur?
+	inc	OP_MSB
+	add	OP_MSB,SCRATCH0 ; Add the MSB of the offset.
+	mov	SRAMAddressMSB,OP_MSB
+	mov	SRAMAddressLSB,OP_LSB
+	mov	w,OP2_MSB	; Get the MSB of the value.
+	call	@SRAMWrite	; Save it.
+	INC_SRAM_ADDRESS
+	mov	w,OP2_LSB	; Get the LSB of the value.
+	call	@SRAMWrite	; Save it.
+	NEXT_OP
+
+
+_l_j_getfield
+	call	@JVMPop		; Pop the object.
+_do_getfield
+	call	@JVMCheckObject
+	call	@JVMGetOpcode	; Get the MSB of the field offset.
+	mov	SCRATCH0,w
+	call	@JVMGetOpcode	; Get the LSB of the field offset
+	add	OP_LSB,w	; Add it to the object offset.
+	snc			; Did a carry occur?
+	inc	OP_MSB
+	add	OP_MSB,SCRATCH0 ; Add the MSB of the offset.
+	mov	SRAMAddressMSB,OP_MSB
+	mov	SRAMAddressLSB,OP_LSB
+	call	@SRAMRead	; Read the MSB of the field.
+	mov	OP2_MSB,w
+	INC_SRAM_ADDRESS
+	call	@SRAMRead	; Read the LSB of the field.
+	mov	OP2_LSB,w
+	call	@JVMPush2	; Push the field value onto the stack.
+	NEXT_OP
+
+_l_j_baload
+_l_j_iaload
+	call	@JVMPop2	; Pop the element index.
+	call	@JVMPop		; Pop the array pointer.
+	call	@JVMCheckArray	; Check for NULL and boundary errors.
+	cje	JVM_OPCODE,#j_baload,:ba ; Was the instruction 'baload'?
+	clc
+	rl	OP2_LSB		; Multiply the element index by 2.
+	rl	OP2_MSB
+:ba	add	OP2_LSB,#4	; Advance over the length and class pointer.
+	snc
+	inc	OP2_MSB
+	add	OP_LSB,OP2_LSB	; Point to the element.
+	snc
+	inc	OP_MSB
+	add	OP_MSB,OP2_MSB
+	mov	SRAMAddressMSB,OP_MSB
+	mov	SRAMAddressLSB,OP_LSB
+	call	@SRAMRead	; Read the MSB.
+	mov	OP_MSB,w
+	INC_SRAM_ADDRESS
+	call	@SRAMRead	; Read the LSB.
+	mov	OP_LSB,w
+	cjne	JVM_OPCODE,#j_baload,:ba3 ; Was the instruction 'baload'?
+	mov	OP_LSB,OP_MSB	; The LSB is really the MSB
+	rl	OP_LSB		; Perform sign extension.
+	mov	OP_MSB,#-1
+	sc
+	clr	OP_MSB
+	rr	OP_LSB
+:ba3	call	@JVMPush	; Push the value onto the stack.
+	NEXT_OP
+
+_l_j_bastore
+_l_j_i2b
+	call	@JVMPop
+	mov	w,#-1
+	snb	OP_LSB.7
+	mov	OP_MSB,w
+	sb	OP_LSB.7
+	clr	OP_MSB
+	call	@JVMPush
+	cse	JVM_OPCODE,#j_bastore
+	NEXT_OP
+
+_l_j_iastore
+	call	@JVMPop2	; Pop the value.
+	mov	OP3_MSB,OP2_MSB	; Save in third operand.
+	mov	OP3_LSB,OP2_LSB
+	call	@JVMPop2	; Pop the element index.
+	call	@JVMPop		; Pop the array pointer.
+	call	@JVMCheckArray	; Check for NULL and boundary errors.
+	cje	JVM_OPCODE,#j_bastore,:ba ; Was the instruction 'bastore'?
+	clc
+	rl	OP2_LSB		; Multiply the element index by 2.
+	rl	OP2_MSB
+:ba	add	OP2_LSB,#4	; Advance over the length and class pointer.
+	snc
+	inc	OP2_MSB
+	add	OP_LSB,OP2_LSB	; Point to the element.
+	snc
+	inc	OP_MSB
+	add	OP_MSB,OP2_MSB
+	mov	SRAMAddressMSB,OP_MSB
+	mov	SRAMAddressLSB,OP_LSB
+	cje	JVM_OPCODE,#j_bastore,:ba2 ; Was the instruction 'bastore'?
+	mov	w,OP3_MSB
+	call	@SRAMWrite	; Write the MSB.
+	INC_SRAM_ADDRESS
+:ba2	mov	w,OP3_LSB
+	call	@SRAMWrite	; Write the LSB.
+	NEXT_OP
+
+;-------------------------------------------------------------------------------
+; Subroutine: nm_jstamp_core_setInput
+;             nm_jstamp_core_setOutput
+;
+; Make a pin an input or an output.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+nm_jstamp_core_setOutput
+	mov	FSR, #nmBlockBank		;Block bank (pointing to Port parameter)
+	call	@nmSetPinOut			;Make pin an input
+	jmp	@nmReturnNone
+
+nm_jstamp_core_setInput
+	mov	FSR, #nmBlockBank		;Block bank (pointing to Port parameter)
+	call	@nmSetPinIn			;Make pin an input
+	jmp	@nmReturnNone
+
+nmMessageMSB	=	nmBlockBank+0
+nmMessageLSB	=	nmBlockBank+1
+nmMessageLenMSB	=	nmBlockBank+2
+nmMessageLenLSB	=	nmBlockBank+3
+
+nm_jstamp_core_CPU_message
+_DebugMessage
+	mov	OP_LSB,nmMessageLSB
+	mov	OP_MSB,nmMessageMSB
+	mov	OP2_LSB,nmMessageLenLSB
+	mov	OP2_MSB,nmMessageLenMSB
+	bank	JVMVars
+	add	OP_LSB,#4		; Skip over the object pointer, length and first byte.
+	snc
+	inc	OP_MSB
+	mov	SRAMAddressMSB,OP_MSB
+	mov	SRAMAddressLSB,OP_LSB
+	test	OP2_MSB
+	snz
+	inc	OP2_MSB
+	mov	w,#errMessage		; Indicate this is a message.
+	call	@DebugStartMessage
+:loop	bank	JVMVars
+	call	@SRAMRead
+	call	@DebugSendByte
+	bank	JVMVars
+	inc	SRAMAddressLSB
+	snz
+	inc	SRAMAddressMSB
+	decsz	OP2_LSB
+	jmp	@:loop
+	decsz	OP2_MSB
+	jmp	@:loop
+	call	@DebugEndMessage
+	; Wait for UART to be idle.
+	bank	serial
+:wait	clr	wdt
+	test	tx_count		; Wait for transmit to finish.
+	jnz	:wait
+	bank	JVMVars
+	jmp	@nmReturnNone
+
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMReturnVal
+;
+; Return from a method with a value. The value to return with is in OP_xxx.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+org		$800	; 810
+
+_JVMReturnVal
+	call	@JVMReturn	; Unwind the stack.
+	jmp	@JVMPush	; Push the return value.
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMReturn
+;
+; Return from a method by unwinding the stack.
+;
+; If the FP already equals JVM_STACK_BASE then the `main' method has finished.
+; At this point the processor is put into an endless loop.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_JVMReturn
+	mov	w,JVM_FP_MSB	; Compare the frame pointer with the stack base.
+	bank	OffsetVars
+	xor	w,JVM_SB_MSB
+	sz
+	jmp	@:notdone
+	mov	w,JVM_SB_LSB
+	bank	JVMVars
+	xor	w,JVM_FP_LSB
+	snz
+	jmp	@_JVMEndProgram
+:notdone
+	bank	JVMVars
+	call	@JVMPopByte	; Pop the PC LSB.
+	mov	JVM_PC_LSB,w
+	call	@JVMPopByte	; Pop the PC MSB.
+	mov	JVM_PC_MSB,w
+	mov	OP2_MSB,JVM_FP_MSB	; Save the current FP.
+	mov	OP2_LSB,JVM_FP_LSB
+	call	@JVMPopByte	; Pop the old FP LSB.
+	mov	JVM_FP_LSB,w
+	call	@JVMPopByte	; Pop the old FP MSB.
+	mov	JVM_FP_MSB,w
+	call	@JVMPopByte	; Pop the method pointer.
+	mov 	JVM_METHOD_LSB,w
+	call	@JVMPopByte	; Pop the method pointer.
+	mov 	JVM_METHOD_MSB,w
+	mov	JVM_SP_MSB,OP2_MSB	; The SP becomes the old FP.
+	mov	JVM_SP_LSB,OP2_LSB
+	retp
+
+	; The program is finished. Force to debug mode and reset.
+_JVMEndProgram
+	bank	debugger
+	cse	debugState,#debugStateStep	; Check if the debugger is stepping.
+	jmp	:start
+	mov	w,#(comStepDone|debugReplyBit)	; Indicate the step is finished
+	call	@DebugSendReply
+:start	mov	w,#errEnd		; Send the 'end of program message'.
+	call	@DebugSendMessage
+	bank	serial
+:wait	clr	wdt
+	test	tx_count		; Wait for transmit to finish.
+	jnz	:wait
+	bank	JVMVars
+	clr	SRAMAddressLSB
+	clr	SRAMAddressMSB
+	mov	w,#kEndMagic		; Load the debug flag.
+	call	@SRAMWrite
+	jmp	@ReInit
+
+;--------------------------------------------------------------------------
+; EEPROM communication
+;--------------------------------------------------------------------------
+
+I2C_write
+	bank	i2c
+        mov	i2c_data,w			; Save w
+	mov	m,#MODE_WRITE_DIR
+	mov	!i2c_port,#i2c_portsetup_w
+	call	I2C_Set_address		; Write address to slave
+:page_mode
+    	mov	w,i2c_data
+	call	I2C_Write_byte			; Send data byte
+	call	I2C_Send_stop			; Signal stop condition
+:done
+	retp
+
+I2C_Set_address
+	call	I2C_Send_start			; Send start bit
+	mov	w,#i2c_control_w            	; Get write control byte
+	call	I2C_Write_byte			; Write it & use ack polling
+	sc
+	jmp	I2C_Set_address     		; Until EEPROM ready
+	mov	w,i2c_address_msb              	; Get EEPROM address pointer
+	call	I2C_Write_byte              	; and send it
+	mov	w,i2c_address_Lsb              	; Get EEPROM address pointer
+	call	I2C_Write_byte              	; and send it
+	retp
+
+I2C_Write_byte
+	mov	i2c_byte,w			; Store byte to send
+	mov	i2c_count,#8                	; Set up to write 8 bits
+:next_bit
+	call	I2C_Write_bit               	; Write next bit
+	rl	i2c_byte                    	; Shift over to next bit
+	djnz	i2c_count,:next_bit         	; Whole byte written yet?
+	call	I2C_Read_bit                	; Yes, get acknowledge bit
+	stc
+	snb	i2c_in_bit                  	; Did we get ack (low=yes)?
+	clc     		        	; If not, flag it
+	retp                            	; Leave and fix page bits
+
+I2C_Write_bit
+	movb	i2c_sda,i2c_out_bit		; Put tx bit on data line
+I2C_Write_bit2
+	mov	!i2c_port,#i2c_portsetup_w	; Set Port  up to write
+	nop					; 100ns data setup delay
+	nop
+	setb	i2c_scl				; Flip I2C clock to high
+	call	I2C_Bus_delay			; Do delay while bus settles
+	clrb	i2c_scl				; Return I2C clock low
+	mov	!i2c_port,#i2c_portsetup_r	; Set sda->input in case ack
+	call	I2C_Bus_delay			; Allow for clock=low cycle
+	retp
+
+I2C_Send_start
+	setb	i2c_sda				; Pull data line high
+	mov	!i2c_port,#i2c_portsetup_w	; Setup I2C to write bit
+	nop					; 100ns data setup delay
+	nop
+	setb	i2c_scl				; Pull I2C clock high
+	call	I2C_Bus_delay			; Allow start setup time
+:new    clrb	i2c_sda				; Data line goes high->low
+	call	I2C_Bus_delay			; Allow start hold time
+	clrb	i2c_scl				; Pull I2C clock low
+	call	I2C_Bus_delay			; Pause before next function
+	retp
+
+I2C_Send_stop
+	clrb	i2c_sda                     	; Pull data line low
+	mov	!i2c_port,#i2c_portsetup_w	; Setup I2C to write bit
+	nop		                 	; 100ns data setup delay      
+	nop        					; 100ns data setup delay
+	setb	i2c_scl				; Pull I2C clock high
+	call	I2C_Bus_delay			; Allow stop setup time
+	setb	i2c_sda				; Data line goes low->high
+	call	I2C_Bus_delay			; Allow start/stop hold time
+	retp
+
+I2C_Bus_delay
+	mov	w,#i2c_time			; Get timing for delay loop
+	mov	i2c_temp,W			; Save it
+:loop   djnz	i2c_temp,:loop			; Do delay
+	retp
+
+;  Read from I2C EEPROM
+I2C_Read
+	bank	i2c
+	mov	m,#MODE_WRITE_DIR
+	mov	!i2c_port,#i2c_portsetup_w
+	call    I2C_Set_address			; Write address to slave
+:current
+	call	I2C_Send_start			; Signal start of read
+	mov	w,#i2c_control_r		; Get read control byte
+	call	I2C_Write_byte			; and send it
+:sequential
+	mov	i2c_count,#8			; Set up for 8 bits
+	clr	i2c_byte
+:next_bit
+	rl	i2c_byte			; Shift result for next bit
+	call	I2C_Read_bit			; Get next bit
+	djnz	i2c_count,:next_bit		; Got whole byte yet?
+	clrb	i2c_sda
+	sb	i2c_sequential			; Is this a sequential read?
+	call    I2C_Send_stop			; Signal stop & exit
+	mov	w,i2c_byte
+	retp
+
+I2C_Read_bit
+	clrb	i2c_in_bit			; Assume input bit low
+	mov	!i2c_port,#i2c_portsetup_r	; Set Port up to read
+	setb	i2c_scl				; Flip I2C clock to high
+	call	I2C_Bus_delay			; Go do delay
+	snb	i2c_sda				; Is data line high?
+	setb	i2c_in_bit			; Yes, switch input bit high
+	clrb	i2c_scl				; Return I2C clock low
+	call	I2C_Bus_delay			; Go do delay
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: SRAMWrite
+;
+; Write a byte to the SRAM. The address should be set by the caller using
+; SRAMAddressMSB and SRAMAddressLSB (ports ra and rd).
+;
+; W on entry: The byte to write.
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+;
+; Interrupt Theory:
+;  If a fatal interrupt occurs after clrb WriteEnable then ISR will have cleared
+;  WriteEnable thus the code will do a read (harmless) and retry again.
+;  If a fatal interrupt occurs after the address has been written but before the
+;  clrb WriteEnable then wrong address will be written to! Must check for interrupt
+;  prior to allowing write to go ahead.
+;
+
+SRAMWrite
+_SRAMWrite
+	mov	Scratch1, w			; Save w.
+:redo	clrb	SRAMResetFlag
+
+	mov	SRAMAddrBus, SRAMAddressMSB
+	mov	SRAMDataBus, SRAMAddressLSB
+	mov	!SRAMDataBus, #$00
+	setb	SRAMLatchEnable
+	clrb	SRAMLatchEnable
+	mov	SRAMDataBus, Scratch1		;Output data
+	clrb	SRAMWriteEnable
+	sb	SRAMResetFlag			; Did an interrupt occur in which a SRAM read occured?
+	clrb	SRAMChipSelect
+	nop					; Support 70ns SRAM.
+	setb	SRAMChipSelect
+	setb	SRAMWriteEnable
+	snb	SRAMResetFlag			; Did an interrupt occur in which a SRAM read occured?
+	jmp	:redo				; Yes. Redo the write.
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: SRAMRead
+;
+; Read a byte from the SRAM. The address should be set by the caller using
+; SRAMAddressMSB and SRAMAddressLSB (ports ra and rd).
+;
+; The nops are required because there is a three cycle delay between
+; the writeback stage for the setb instruction and the decode/issue stage for the
+; mov instruction. Not trivial!!
+;
+; W on entry: -
+; W on exit : The byte read
+; Variables : -
+;-------------------------------------------------------------------------------
+
+SRAMRead
+_SRAMRead
+:redo	clrb	SRAMResetFlag
+	mov	SRAMAddrBus, SRAMAddressMSB
+	mov	SRAMDataBus, SRAMAddressLSB
+	mov	!SRAMDataBus, #$00
+	setb	SRAMLatchEnable
+	clrb	SRAMLatchEnable
+	mov	!SRAMDataBus, #$FF
+	setb	SRAMWriteEnable
+	clrb	SRAMChipSelect
+	nop
+	nop
+	mov	w, SRAMDataBus
+	setb	SRAMChipSelect
+	snb	SRAMResetFlag			; Did an interrupt occur in which a SRAM read occured?
+	jmp	:redo				; Yes. Redo the read.
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMEnterMethod, JVMEnterVirtualMethod
+;
+; Enter a new function which may be either Java or native. This routine creates
+; the local stack frame. If the method is Java is then the PC is set appropriately.
+; If it is native then execution is passed to the native function.
+;
+; For static or special methods the PC should point to the two bytes of the
+; method offset. For virtual methods it should be the offset from the class
+; header.
+;
+; The _JVMStubMethod should be used when the PC is already pointing to the method
+; stub.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_JVMEnterVirtualMethod
+	call	@JVMGetOpcode		; Read the object offset.
+	mov	OP_MSB,w
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Load the stack pointer
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	mov	w,OP_MSB
+	sub	SRAMAddressLSB,w	; Subtract the object offset.
+	sc
+	dec	SRAMAddressMSB
+	call	@SRAMRead		; Read the object MSB
+	mov	OP_MSB,w		; Save it.
+	INC_SRAM_ADDRESS		; Point to the LSB
+	call	@SRAMRead		; Read the object LSB
+	mov	OP_LSB,w
+	call	@JVMCheckObject		; Check the object is non-null.
+	mov	SRAMAddressLSB,OP_LSB	; Save it.
+	mov	SRAMAddressMSB,OP_MSB	; Load the object pointer
+	call	@SRAMRead		; Read the class header MSB.
+	mov	OP2_MSB,w		; Save it.
+	INC_SRAM_ADDRESS		; Point to the LSB.
+	call	@SRAMRead		; Read the class header LSB.
+	mov	OP2_LSB,w		; Save it.
+	call	@JVMGetOpcode		; Read the method offset.
+	add	OP2_LSB,w		; Add it to the class header.
+	snc
+	inc	OP2_MSB
+	mov	OP_MSB,JVM_PC_MSB	; Save the program counter.
+	mov	OP_LSB,JVM_PC_LSB
+	mov	JVM_PC_MSB,OP2_MSB	; Set the program counter.
+	mov	JVM_PC_LSB,OP2_LSB
+	jmp	@_JVMStubMethod	; Continue with the method invocation.
+_JVMEnterMethod
+	; Create the new stack frame.
+	call	@JVMGetOpcode	; Read the MSB of the method stub
+	mov	OP_MSB,w	; Save it in the operand.
+	call	@JVMGetOpcode	; Read the LSB of the method stub
+	mov	OP_LSB,w	; Save it in the operand.
+	mov	w,JVM_PC_MSB	; Load the MSB of the PC.
+	call	@JVMPushByte	; Push it onto the stack.
+	mov	w,JVM_PC_LSB	; Load the LSB of the PC.
+	call	@JVMPushByte	; Push it onto the stack.
+	mov	JVM_PC_MSB,OP_MSB	; Set the PC to the stub.
+	mov	JVM_PC_LSB,OP_LSB
+	call	@JVMPop
+_JVMStubMethod
+	bank	JVMVars
+	mov	OP2_MSB,JVM_FP_MSB	; Save the frame pointer
+	mov	OP2_LSB,JVM_FP_LSB
+	mov	JVM_FP_MSB,JVM_SP_MSB	; Set the new FP to the SP
+	mov	JVM_FP_LSB,JVM_SP_LSB
+	call	@JVMGetOpcode	; Read the number of parameters.
+	and 	w,#%01111111	; Remove the exception table flag.
+	sub	JVM_FP_LSB,w	; Subtract the number of parameters from the FP.
+	sc
+	dec	JVM_FP_MSB
+	mov	EEAddressMSB,JVM_PC_MSB
+	mov	EEAddressLSB,JVM_PC_LSB
+	call	@JVMEERead	; Read the number of locals.
+	mov	SCRATCH0,w	; Save.
+	test	SCRATCH0
+	snz			; Is the # of locals zero?
+	jmp	:clearDone	; Yes.
+	mov	SRAMAddressMSB,JVM_SP_MSB
+	mov	SRAMAddressLSB,JVM_SP_LSB
+:loop	mov	w,#0		; Zero the memory for the locals.
+	call	@SRAMWrite
+	INC_SRAM_ADDRESS
+	INC_SP
+	decsz	SCRATCH0
+	jmp	:loop
+:clearDone
+	mov	w,JVM_METHOD_MSB; Get the current method pointer.
+	call	@JVMPushByte	; Push it onto the stack.
+	mov	w,JVM_METHOD_LSB; Get the current method pointer.
+	call	@JVMPushByte	; Push it onto the stack.
+	mov	JVM_METHOD_MSB,JVM_PC_MSB	; Set the new method pointer.
+	mov	JVM_METHOD_LSB,JVM_PC_LSB
+	DEC_MP
+:nodec	INC_PC			; This was delayed from the previous read.
+	call	@JVMPush2	; Push the old FP.
+	call	@JVMPush	; Push the old PC.
+	; The new stack frame is now complete.
+
+	call	@JVMGetOpcode	; Read the flags.
+	mov	OP_MSB,w
+	snb	OP_MSB.JEMNativeMethod	; Is the method native?
+	jmp	:nativeMethod	; Yes, process as a native method.
+	call	@JVMGetOpcode	; Read the MSB of the code offset.
+	mov	OP_MSB,w
+	call	@JVMGetOpcode	; Read the LSB of the code offset.
+	mov	JVM_PC_LSB,w	; Set the PC to the method start.
+	mov	JVM_PC_MSB,OP_MSB
+	retp
+
+:nativeMethod
+	call	@JVMGetOpcode	; Ignore the MSB of the offset.
+	call	@JVMGetOpcode	; Load the method number.
+	call	@NativeMethodDispatch	; Dispatch the native method.
+	_bank	JVMVars		; Force a switch back to the lower banks.
+	sz			; Is there a return value?
+	jmp	@JVMReturn	; No  => Return without a value. (JVMReturn issues retp instruction)
+	jmp	@JVMReturnVal	; Yes => Return with a value. (JVMReturnVal issues retp instruction)
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMCheckArray
+;
+; Check an array access for null pointer and out of bounds exceptions.
+; OP_?SB holds the array pointer.
+; OP2_?SB holds the index.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_JVMCheckArray
+	call	@JVMCheckObject		; Check for a null pointer first.
+	mov	SRAMAddressLSB,OP_LSB
+	mov	SRAMAddressMSB,OP_MSB
+	add	SRAMAddressLSB,#2	; Skip over the class pointer.
+	snc
+	inc	SRAMAddressMSB
+	call	@SRAMRead		; Read the MSB.
+	mov	Scratch0,w
+	mov	w,OP2_MSB-w		; Check if indexMSB < lengthMSB
+	sc
+	retp				; OK.
+	INC_SRAM_ADDRESS
+	call	@SRAMRead		; Read the LSB.
+	mov	w,OP2_LSB-w		; Check if indexLSB < lengthLSB
+	snc
+	jmp	:throw
+	mov	w,OP2_MSB
+	mov	w,Scratch0-w		; Check that indexMSB = lengthMSB
+	snz
+	retp				; OK.
+:throw	mov	Scratch0,#eArrayIndexOutOfBoundsException
+	jmp	throwException
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMCheckObject
+;
+; Check for null object pointer exception.
+; OP_?SB holds the object pointer.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_JVMCheckObject
+	test	OP_LSB			; Test the LSB of the pointer.
+	sz
+	retp
+	test	OP_MSB			; Test the MSB of the pointer.
+	sz
+	retp
+	mov	Scratch0,#eNullPointerException
+throwException
+	mov	OP_MSB,JVM_PC_MSB
+	mov	w,JVM_PC_LSB
+	bank	ExceptionVars
+	mov	JVM_TPC_LSB,w
+	mov	JVM_TPC_MSB,OP_MSB
+	bank	JVMVars
+	setb	JVM_ESET_FLAG
+	mov	w,Scratch0
+	call	@JVMThrow		; Throw an exception.
+
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMCheckMemory
+;
+; Check for out of memory condition. We are out of memory if JVM_SP > JVM_HP.
+; OutOfMemoryError exceptions cannot be caught since there is no memory to do
+; anything about them. The exception is immediately treated as unhandled.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_JVMCheckMemory
+	csae	JVM_SP_MSB,JVM_HP_MSB	; Check the MSBs.
+	retp
+	cse	JVM_SP_MSB,JVM_HP_MSB	; Are the equal?
+	jmp	:throw			; No.
+	csa	JVM_SP_LSB,JVM_HP_LSB	; Is the LSB more?
+	retp				; No. OK.
+:throw	bank	OffsetVars		; Throw an unhandled exception
+	mov	Scratch0,JVM_OOM_LSB
+	mov	w,JVM_OOM_MSB
+	bank	ExceptionVars
+	mov	JVM_EType_MSB,w
+	mov	JVM_EType_LSB,Scratch0
+	jmp	@unhandledException
+
+_JVMInit
+	bank	JVMVars
+	clr	JVM_Flags
+	mov	JVM_PC_LSB,#(kProgramStart&$00ff) ; Initialise the program counter.
+	mov	JVM_PC_MSB,#(kProgramStart&$ff00)>>8
+	clr	JVM_FP_MSB			; Initialise the frame pointer.
+	clr	JVM_FP_LSB			; Initialise the frame pointer.
+	mov	JVM_HP_MSB,#(JVM_HEAP_BASE&$ff00)>>8	; Load the location of the heap.
+	mov	JVM_HP_LSB,#(JVM_HEAP_BASE&$00ff)
+	mov	w,#$FF
+	mov	JVM_METHOD_MSB,w	; Initialise the method pointer.
+	mov	JVM_METHOD_LSB,w
+	bank	JVMVars2
+	clr	JVM_SF_MSB		; Initialise the static fields pointer.
+	clr	JVM_SF_LSB		; Initialise the static fields pointer.
+	bank	BPVars
+	clr	JVM_BP_COUNT		; Initialise the breakpoints.
+	bank	JVMVars
+	retp
+
+; Clear all RAM to zeros. This is not necessary, it just makes debugging easier.
+_RAMInit
+	mov	FSR,#$0a	; Reset all ram starting at 0ah
+:zero_ram
+	CLR	IND		;clear using indirect addressing
+	IJNZ	FSR,:zero_ram	;repeat until done
+	retp
+
+; Initialise the processor
+_ProcInit
+	mov	!option,#%10011111	; Enable RTCC rollover.
+_IOInit
+	_bank	Debugger
+	clr	tx_Count
+	bank	JVMVars
+	mov	w,#$1D
+	mov	m,w
+	mov	!rb,#%00000000		; Enable CMOS levels on all inputs.
+	mov	!rc,#%00000000
+	mov	m,#MODE_WRITE_DIR
+	mov	 ra, #%00001111		;CS and WE = high, Dout = high
+	mov	!ra, #%00000010		;ra is all outputs except Din
+	mov	!rb, #%11111111		;rb is Port0 and defaults to all inputs
+	mov	!rc, #%11111111		;rc is Port1 and defaults to all inputs
+	mov	!rd, #%00000000		;rd is all outputs (undefined value)
+	mov	!re, #%11111111		;re is SRAM Data and defaults to all inputs
+	retp
+
+
+;**************************************************************************
+; NATIVE METHODS
+;**************************************************************************
+
+	org	$A00
+
+;-------------------------------------------------------------------------------
+; Subroutine: NativeMethodDispatch
+;
+; Dispatch a native method. Each native method is numbered and a table is
+; generated by the JEMLinker.
+;
+; Native methods use the normal SP and FP. Any return value is returned in
+; OP_xxx.
+;
+; To make the methods easier to write, the nmBlockBank is populated with
+; the methods arguments. The portion of the stack occupied by the native
+; methods arguments is from the FP to the SP-6.
+;
+; W on entry: The native method number.
+; W on exit : z is set to 1 if there is a return value, 0 otherwise.
+; Variables : -
+;-------------------------------------------------------------------------------
+
+nmUartInitCommon	jmp	_nmUartInitCommon
+
+_NativeMethodDispatch
+	mov	OP_MSB,w		; Save w which is the native method index.
+	mov	OP2_MSB,JVM_SP_MSB
+	mov	OP2_LSB,JVM_SP_LSB
+	sub	OP2_LSB,#6
+	sc
+	dec	OP2_MSB
+	mov	SRAMAddressMSB,JVM_FP_MSB
+	mov	SRAMAddressLSB,JVM_FP_LSB
+	mov	OP_LSB,#nmBlockBank	; OP_LSB is the bank pointer.
+:loop	cse	SRAMAddressLSB,OP2_LSB
+	jmp	:again
+	cje	SRAMAddressMSB,OP2_MSB,:done
+:again	call	@SRAMRead		; Read the byte.
+	mov	Scratch0,w
+	mov	FSR,OP_LSB
+	mov	INDF,Scratch0
+	inc	OP_LSB
+	bank	JVMVars
+	INC_SRAM_ADDRESS
+	jmp	:loop
+:done	bank	nmBlockBank
+	mov	w,OP_MSB
+	add	PC,w		; Jump into the table.
+;
+; Native method dispatch table.
+;
+	jmp	nm_jstamp_CPU_writeRegister	; 0
+	jmp	nm_jstamp_core_CPU_readRegister	; 1
+	jmp	nm_jstamp_core_CPU_writeObject	; 2
+	jmp	nm_jstamp_core_CPU_delay	; 3
+	jmp	@nm_jstamp_core_CPU_message	; 4
+	jmp	nm_jstamp_core_CPU_count	; 6
+	jmp	nm_jstamp_core_CPU_rcTime	; 7
+	jmp	nm_jstamp_core_CPU_pulseIn	; 8
+	jmp	nm_jstamp_core_CPU_pulseOut	; 9
+	jmp	nm_jstamp_core_CPU_readPin	; 10
+	jmp	nm_jstamp_core_CPU_writePin	; 11
+	jmp	nm_jstamp_core_CPU_shiftIn	; 12
+	jmp	nm_jstamp_core_CPU_shiftOut	; 13
+	jmp	@nm_jstamp_core_CPU_carry	; 14
+	jmp	nm_jstamp_core_CPU_uninstall	; 16
+	jmp	nm_jstamp_core_CPU_install	; 17
+	jmp	nm_jstamp_core_CPU_nap		; 18
+	jmp	@nm_jstamp_core_setOutput	; 19
+	jmp	@nm_jstamp_core_setInput	; 21
+	jmp	@nm_jstamp_core_readSRAM	; 23
+	jmp	@nm_jstamp_core_writeSRAM	; 25
+ifndef SXDEBUG
+	jmp	@nm_jstamp_core_EEPROM_eeRead	; 27
+	jmp	@nm_jstamp_core_EEPROM_eeWrite	; 29
+else
+	jmp	@nmReturn0000
+	jmp	@nmReturnNone
+endif
+	jmp	nm_jstamp_core_Uart_txInit	; 31
+	jmp	nm_jstamp_core_Uart_rxInit	; 32
+	jmp	nm_jstamp_core_Uart_rxRead	; 33
+	jmp	nm_jstamp_callback_returnTwo	; 34 this is wrong.
+	jmp	nm_jstamp_core_Timer_init	; 35
+ifndef SXDEBUG
+	jmp	@nm_jstamp_core_Timer_latch	; 36
+	jmp	@nm_jstamp_core_PWM_install	; 38
+	jmp	@nm_jstamp_PWM_updateInternal	; 40
+	jmp	@nm_jstamp_core_DAC_install	; 42
+	jmp	@nm_jstamp_core_ADC_install	; 44
+	jmp	@nm_jstamp_core_terminal_getbyte	; 46
+else
+	jmp	@nmReturnNone
+	jmp	@nmReturnNone
+	jmp	@nmReturnNone
+	jmp	@nmReturnNone
+	jmp	@nmReturnNone
+	jmp	@nmReturn0000
+endif
+
+; ==============================================================================
+;  I/O Pin Routines
+; ==============================================================================
+
+nmReadPin					;	INDF = Port Select, INDF+1 = Pin bitmask
+	inc	FSR				;1	pointing to bit mask
+	mov	w, INDF				;1	Read bit mask
+	dec	FSR				;1	pointing to port
+	sb	INDF.0				;1/2	Port 0 ?
+	and	w, nmPort0			;1	Yes => Read port 0
+	snb	INDF.0				;1/2	Port 1 ?
+	and	w, nmPort1			;1	Yes => Read port 1
+	sz					;1/2	Pin low ?
+	mov	w, #$01				;1	No => will return high
+	retp
+
+nmSetPinLow					;10	INDF = Port Select, INDF+1 = Pin bitmask
+	inc	FSR				;1	pointing to bit mask
+	mov	w, /INDF			;1	w = !(pin mask)
+	dec	FSR				;1	pointing to port
+	sb	INDF.0				;1/2	Port 0 ?
+	and	nmPort0, w			;1	Yes => clear bit
+	snb	INDF.0				;1/2	Port 1 ?
+	and	nmPort1, w			;1	Yes => clear bit
+	retp					;3
+
+nmSetPinHigh					;10	INDF = Port Select, INDF+1 = Pin bitmask
+	inc	FSR				;1	pointing to bit mask
+	mov	w, INDF				;1	w = pin mask
+	dec	FSR				;1	pointing to port
+	sb	INDF.0				;1/2	Port 0 ?
+	or	nmPort0, w			;1	Yes => set bit
+	snb	INDF.0				;1/2	Port 1 ?
+	or	nmPort1, w			;1	Yes => set bit
+	retp					;3
+
+nmSetPinInvert					;10	INDF = Port Select, INDF+1 = Pin bitmask
+	inc	FSR				;1	pointing to bit mask
+	mov	w, INDF				;1	w = pin mask
+	dec	FSR				;1	pointing to port
+	sb	INDF.0				;1/2	Port 0 ?
+	xor	nmPort0, w			;1	Yes => clear bit
+	snb	INDF.0				;1/2	Port 1 ?
+	xor	nmPort1, w			;1	Yes => clear bit
+	retp					;3
+
+nmSetPinIn					;20	INDF = Port Select, INDF+1 = Pin bitmask
+	mov	w, #$0F				;1	Prepare to read DDR
+	mov	m, w				;1	Prepare to read DDR
+	sb	INDF.0				;1/2	Port 0 ?
+	mov	!nmPort0, w			;1	w = DDR
+	snb	INDF.0				;1/2	Port 1 ?
+	mov	!nmPort1, w			;1	w = DDR
+	mov	nmTemp, w			;1	Store DDR in temp variable
+	mov	w, #$1F				;1	Prepare to write DDR
+	mov	m, w				;1	Prepare to write DDR
+	inc	FSR				;1	pointing to bit mask
+	mov	w, INDF				;1	w = pin mask
+	or	w, nmTemp			;1	w = new DDR
+	dec	FSR				;1	pointing to port
+	sb	INDF.0				;1/2	Port 0 ?
+	mov	!nmPort0, w			;1	Store new DDR
+	snb	INDF.0				;1/2	Port 1 ?
+	mov	!nmPort1, w			;1	Store new DDR
+	retp					;3
+
+nmSetPinOut					;20	INDF = Port Select, INDF+1 = Pin bitmask
+	mov	w, #$0F				;1	Prepare to read DDR
+	mov	m, w				;1	Prepare to read DDR
+	sb	INDF.0				;1/2	Port 0 ?
+	mov	!nmPort0, w			;1	w = DDR
+	snb	INDF.0				;1/2	Port 1 ?
+	mov	!nmPort1, w			;1	w = DDR
+	mov	nmTemp, w			;1	Store DDR in temp variable
+	mov	w, #$1F				;1	Prepare to write DDR
+	mov	m, w				;1	Prepare to write DDR
+	inc	FSR				;1	pointing to bit mask
+	mov	w, /INDF			;1	w = !(pin mask)
+	and	w, nmTemp			;1	w = new DDR
+	dec	FSR				;1	pointing to port
+	sb	INDF.0				;1/2	Port 0 ?
+	mov	!nmPort0, w			;1	Store new DDR
+	snb	INDF.0				;1/2	Port 1 ?
+	mov	!nmPort1, w			;1	Store new DDR
+	retp					;3
+
+; ==============================================================================
+;  General Blocking Subroutines
+; ==============================================================================
+
+nmBlockTimeoutH	=	nmBlockBank + $0	;1st Parameter = Timeout
+nmBlockTimeoutL	=	nmBlockBank + $1	;1st Parameter = Timeout
+nmBlockPort	=	nmBlockBank + $2	;2nd Parameter = Port/Pin
+nmBlockPin	=	nmBlockBank + $3	;2nd Parameter = Port/Pin
+nmBlockState	=	nmBlockBank + $5	;3rd Parameter = State
+nmBlockTemp	=	nmBlockBank + $F	;Internal variable
+
+nmReturnNone
+	clz
+	retp
+
+nmReturn0000
+	clr	nmResultH
+	clr	nmResultL
+	retp					;Return Z=true
+
+nmReturnFFFF
+	mov	w, #$FF
+	mov	nmResultH, w
+	mov	nmResultL, w
+nmReturnData
+	stz
+	retp
+
+nmInterruptDelay
+	mov	nmBlockTemp, w			;Store delay time
+:Loop	clr	!wdt
+	sb	nmInterruptFlag
+	jmp	:Loop
+	clrb	nmInterruptFlag
+	decsz	nmBlockTemp
+	jmp	:Loop
+	retp
+
+nmInterruptSync
+:Loop	clr	!wdt
+	sb	nmInterruptFlag
+	jmp	:Loop
+	clrb	nmInterruptFlag
+	retp
+
+nmTestPin					;
+	mov	w, nmPort0			;Read port 0
+	snb	nmBlockPort.0			;Port 1 ?
+	mov	w, nmPort1			;Yes => read port 1
+	snb	nmBlockState.0			;Desired to be a 1 ?
+	xor	w, #$FF				;Yes => invert port data
+	and	w, nmBlockPin			;apply bit mask
+	retp					;z is set for a match
+
+nmInitResultAndTimeout
+	inc	nmBlockTimeoutH
+	inc	nmBlockTimeoutL
+
+nmInitResult
+	clr	nmResultH
+	clr	nmResultL
+	retp
+
+nmDecTimeout
+	clr	wdt		; Clear the watchdog.
+	clz
+	decsz	nmBlockTimeoutL			;No  => Increment result and try again
+	retp
+	dec	nmBlockTimeoutH
+	retp
+
+nmIncResult
+	clz
+	incsz	nmResultL
+	retp
+	inc	nmResultH
+	retp
+
+; ==============================================================================
+;  ShiftIn/ShiftOut subroutines
+; ==============================================================================
+
+nmShiftClockPulse
+	mov	FSR, #nmShiftClockPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmInterruptSync			;Wait for the interrupt
+	call	nmSetPinInvert			;Pointing to clock pin
+	call	nmInterruptSync			;Wait for the interrupt
+	call	nmSetPinInvert			;Pointing to clock pin
+	call	nmInterruptSync			;Wait for the interrupt
+	retp
+
+nmShiftReadData
+	mov	w, nmPort0			;Read port 0
+	snb	nmShiftDataPort.0		;Port 1 ?
+	mov	w, nmPort1			;Yes => Read port 1
+	and	w, nmShiftDataPin		;Apply bit mask
+	clc					;Assume zero
+	sz					;Pin zero ?
+	stc					;No => change result to high
+	snb	nmShiftMode.1			;Read MSB first ?
+	jmp	:LSB
+:MSB	rl	nmResultL
+	rl	nmResultH
+	retp
+:LSB	rr	nmResultH
+	rr	nmResultL
+	retp
+
+; Write a value to a register. The address and value are in local 0 and local 1.
+nmAddrMSB	=	nmBlockBank
+nmAddrLSB	=	nmBlockBank+1
+nmValueMSB	=	nmBlockBank+2
+nmValueLSB	=	nmBlockBank+3
+nm_jstamp_CPU_writeRegister
+	mov	OP_LSB,nmValueLSB
+	mov	FSR,nmAddrLSB
+	mov	INDF,OP_LSB	; Write the register.
+	jmp	nmReturnNone
+
+; Write a value to a register. The address and value are in local 0 and local 1.
+nmAddrMSB	=	nmBlockBank
+nmAddrLSB	=	nmBlockBank+1
+nmValueMSB	=	nmBlockBank+2
+nmValueLSB	=	nmBlockBank+3
+nm_jstamp_core_CPU_writeObject
+	mov	OP_LSB,nmValueLSB
+	mov	OP_MSB,nmValueMSB
+	mov	FSR,nmAddrLSB
+	mov	INDF,OP_MSB	; Write the register.
+	inc	FSR
+	mov	INDF,OP_LSB
+	jmp	nmReturnNone
+
+; Read a register. The address is in the LSB of local 0.
+nmAddrMSB	=	nmBlockBank
+nmAddrLSB	=	nmBlockBank+1
+nm_jstamp_core_CPU_readRegister
+	mov	FSR,nmAddrLSB
+	mov	OP_LSB,INDF	; Load the value.
+	clr	OP_MSB
+	jmp	nmReturnData
+
+
+
+; ==============================================================================
+;  ShiftIn(DataPortPin, ClockPortPin, BitCount, Mode, LowTime, HighTime): Data
+; ==============================================================================
+;  Description:
+;      Reads data from a synchronous serial device.
+;      Makes DataPortPin an input and ClockPortPin an output
+;  Parameters:
+;      DataPortPin: Bit     8 = 0/1 for Port0/Port1
+;                   Bits  7:0 = bitmask of the desired pin (1 of 8 a '1')
+;      ClockPortPin: Same as DatPortPin
+;      BitCount     Bits  7:0 = Number of bits to read (Must be > 0)
+;      Mode         Bit     0 = Sample position: Post clock if set, pre clock if clear
+;                   Bit     1 = LSB fisrt if set, MSB first if clear
+;  Result = Data bits received. Note if LSB first then result will be left justified!
+; ==============================================================================
+;  ShiftOut(DataPortPin, ClockPortPin, BitCount, Mode, LowTime, HighTime, Data)
+; ==============================================================================
+;  Description:
+;      Writes data to a synchronous serial device.
+;      Makes DataPortPin and ClockPortPin outputs
+;  Parameters:
+;      DataPortPin: Bit     8 = 0/1 for Port0/Port1
+;                   Bits  7:0 = bitmask of the desired pin (1 of 8 a '1')
+;      ClockPortPin: Same as DatPortPin
+;      BitCount     Bits  7:0 = Number of bits to read (Must be > 0)
+;      Mode         Bit     0 = UNUSED
+;                   Bit     1 = LSB fisrt if set, MSB first if clear
+;      Data:        Bits to send. Note if MSB first then must be left justified!
+; ==============================================================================
+
+nmShiftDataPort		=	nmBlockBank + $0	;1st Parameter = Port/Pin
+nmShiftDataPin		=	nmBlockBank + $1	;1st Parameter = Port/Pin
+nmShiftClockPort	=	nmBlockBank + $2	;2nd Parameter = Port/Pin
+nmShiftClockPin		=	nmBlockBank + $3	;2nd Parameter = Port/Pin
+nmShiftBitCount		=	nmBlockBank + $5	;3rd Parameter = BitCount
+nmShiftMode		=	nmBlockBank + $7	;4th Parameter = Mode
+nmShiftDataH		=	nmBlockBank + $8	;7th Parameter = Data
+nmShiftDataL		=	nmBlockBank + $9	;7th Parameter = Data
+
+nm_jstamp_core_CPU_shiftin
+	mov	FSR, #nmShiftClockPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinOut			;Make clock pin an output
+	mov	FSR, #nmShiftDataPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinIn			;Make data pin an input
+	call	nmInitResult
+	clrb	nmInterruptFlag
+	call	nmInterruptSync			;Ensure min time of 1 interrupt
+:Loop	sb	nmShiftMode.0			;Read pre clock ?
+	call	nmShiftReadData			;Yes => Read data pin
+	call	nmShiftClockPulse		;Output clock pulse
+	snb	nmShiftMode.0			;Read post clock ?
+	call	nmShiftReadData			;Yes => Read data pin
+	decsz	nmShiftBitCount
+	jmp	:Loop
+	jmp	nmReturnData
+
+nm_jstamp_core_CPU_shiftout
+	mov	FSR, #nmShiftClockPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinOut			;Make clock pin an output
+	mov	FSR, #nmShiftDataPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinOut			;Make data pin an output
+	clrb	nmInterruptFlag
+	call	nmInterruptSync			;Ensure min time of 1 interrupt
+:Loop	mov	FSR, #nmShiftDataPort		;Change to blocking bank (FSR pointing to port select)
+	snb	nmShiftMode.1			;Read MSB first ?
+	jmp	:LSB
+:MSB	rl	nmShiftDataL
+	rl	nmShiftDataH
+	jmp	:Out
+:LSB	rr	nmShiftDataH
+	rr	nmShiftDataL
+:Out	sc					;Toggle the output pin appropriately.
+	call	nmSetPinLow
+	snc
+	call	nmSetPinHigh
+	call	nmShiftClockPulse		;Output clock pulse
+	decsz	nmShiftBitCount			;Reduce the cout.
+	jmp	:Loop
+	jmp	nmReturnNone
+
+
+; ==============================================================================
+;  Delay(Time)
+; ==============================================================================
+;  Description:
+;      Blocking delay for a period of time from 0 to 6.5536s in 100us units.
+;      Initial error: up to -8.68us.
+;      Cumulative error: 100us -> 99.82us => -0.18% error
+;  Parameters:
+;      Time = delay time in 100us units [0:65535]
+; ==============================================================================
+
+nmPauseTimeH	=	nmBlockTimeoutH		;1st Parameter = Timeout
+nmPauseTimeL	=	nmBlockTimeoutL		;1st Parameter = Timeout
+
+nm_jstamp_core_CPU_delay
+	bank	nmBlockBank			;Change to blocking bank (FSR pointing to port select)
+	call	nmInitResultAndTimeout		;Prepare timeout and init result to 0
+	clrb	nmInterruptFlag			;Prepare to wait for next interrupt
+:Loop	call	nmDecTimeout			;Check the time
+	snz					;Timeout (Time is 0) ?
+	jmp	nmReturnNone			;Yes => Complete
+	mov	w, #11				;No  => delay 100us (11 * 8.68us = 95.48us)
+	call	nmInterruptDelay		;Wait for 100us
+	jmp	:Loop
+
+; ==============================================================================
+;  Output(PortPin, State)
+; ==============================================================================
+;  Description:
+;      Makes PortPin an output and sets value to that of State.
+;  Parameters:
+;      PortPin: Bit    8 = 0/1 for Port0/Port1
+;               Bits 7:0 = bitmask of the desired pin (1 of 8 a '1')
+;      State: 0 or 1 for desired output value
+; ==============================================================================
+
+nmOutputPort		=	nmBlockBank + $0	;1st Parameter = Port/Pin
+nmOutputPin		=	nmBlockBank + $1	;1st Parameter = Port/Pin
+nmOutputState		=	nmBlockBank + $3	;2nd Parameter = State
+
+nm_jstamp_core_CPU_writePin
+	mov	FSR, #nmOutputPort		;Block bank (pointing to Port parameter)
+	sb	nmOutputState.0			;Output a 0 ?
+	call	nmSetPinLow			;Yes => init to low
+	snb	nmOutputState.0			;Output a 1 ?
+	call	nmSetPinHigh			;Yes => init to high
+	call	nmSetPinOut			;Make pin an output
+	jmp	nmReturnNone
+
+; ==============================================================================
+;  Input(PortPin): Value
+; ==============================================================================
+;  Description:
+;      Makes PortPin an input and reads value.
+;  Parameters:
+;      PortPin: Bit    8 = 0/1 for Port0/Port1
+;               Bits 7:0 = bitmask of the desired pin (1 of 8 a '1')
+; ==============================================================================
+
+nmInputPort		=	nmBlockBank + $0	;1st Parameter = Port/Pin
+nmInputPin		=	nmBlockBank + $1	;1st Parameter = Port/Pin
+
+nm_jstamp_core_CPU_readPin
+	mov	FSR, #nmInputPort		;Block bank (pointing to Port parameter)
+	call	nmSetPinIn			;Make pin an input
+	call	nmReadPin
+	mov	nmResultL, w
+	clr	nmResultH
+	jmp	nmReturnData			;Return and indicate data
+
+
+; ==============================================================================
+;  PulseOut(Time, PortPin)
+; ==============================================================================
+;  Description:
+;      Inverts pin, waits Time (from 1 to 284ms in 4.34us units), and inverts
+;      output again. A value of 0 will result in no pulse.
+;      Sets PortPin to be an output.
+;      Maximum initial delay of 4.34us prior to start of pulse.
+;  Parameters:
+;      Time = delay time in 4.34us units [0:65535]
+;      PortPin: Bit    8 = 0/1 for Port0/Port1
+;               Bits 7:0 = bitmask of the desired pin (1 of 8 a '1')
+; ==============================================================================
+
+nmPulseOutTimeH		=	nmBlockTimeoutH		;1st Parameter = Timeout
+nmPulseOutTimeL		=	nmBlockTimeoutL		;1st Parameter = Timeout
+nmPulseOutPort		=	nmBlockPort		;2nd Parameter = Port/Pin
+nmPulseOutPin		=	nmBlockPin		;2nd Parameter = Port/Pin
+
+nm_jstamp_core_CPU_pulseout
+	mov	FSR, #nmPulseOutPort		;Block bank (pointing to Port parameter)
+	call	nmSetPinOut			;Make pin an output
+	call	nmInitResultAndTimeout		;Prepare timeout and init result to 0
+	clrb	nmInterruptFlag			;Prepare to wait for next interrupt
+:Start	call	nmDecTimeout			;Check the time
+	snz					;Timeout (Time was 0) ?
+	jmp	nmReturnNone			;Yes => Complete
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmSetPinInvert			;Invert pin
+:Loop	call	nmInterruptSync			;Wait for next interrupt
+	call	nmDecTimeout			;Check the time
+	sz					;Timeout ?
+	jmp	:Loop				;No  => Loop again
+:End	call	nmSetPinInvert			;Yes => Complete, invert pin again
+	jmp	nmReturnNone			;Return
+
+; ==============================================================================
+;  PulseIn(Timeout, PortPin, State): Time
+; ==============================================================================
+;  Description:
+;      Waits until Pin = State and then measures time (in 4.34us units) until
+;      Pin = not State. Timeout covers the total time of the routine.
+;      Returns 0 if no start edge is detected and $FFFF (-1) if no stop edge is
+;      detected.
+;      Sets PortPin to be an input.
+;      Max initial delay of 4.34us priot to first testing pin for idle state. Pin
+;      then tested every 4.34us. Pulses of less than 4.34us may be missed.
+;  Parameters:
+;      Timeout = Maximum time to wait for (in 4.34us units)
+;      PortPin: Bit    8 = 0/1 for Port0/Port1
+;               Bits 7:0 = bitmask of the desired pin (1 of 8 a '1')
+;      State = 1 for 0->1 start, 0 for 1->0 start
+;  Result = Time measured in 4.34us units [0:65535]
+; ==============================================================================
+
+nmPulseInTimeoutH	=	nmBlockTimeoutH		;1st Parameter = Timeout
+nmPulseInTimeoutL	=	nmBlockTimeoutL		;1st Parameter = Timeout
+nmPulseInPort		=	nmBlockPort		;2nd Parameter = Port/Pin
+nmPulseInPin		=	nmBlockPin		;2nd Parameter = Port/Pin
+nmPulseInState		=	nmBlockState		;3rd Parameter = State
+
+nm_jstamp_core_CPU_pulsein
+	mov	FSR, #nmPulseInPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinIn			;Make pin an input
+	call	nmInitResultAndTimeout		;Prepare timeout and init result to 0
+	clrb	nmInterruptFlag			;Prepare to wait for next interrupt
+:Idle	call	nmDecTimeout			;Yes => Wait until not match
+	snz					;Timeout ?
+	jmp	nmReturn0000			;Overflow => return 0000
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin and compare with desired state
+	snz					;Match ?
+	jmp	:Idle				;Yes => still waiting for idle
+:Start	call	nmDecTimeout			;No  => Wait until match
+	snz					;Timeout ?
+	jmp	nmReturn0000			;Overflow => return 0000
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin and compare with desired state
+	sz					;Match ?
+	jmp	:Start				;No => try again
+:Time	call	nmDecTimeout
+	snz
+	jmp	nmReturnFFFF			;Overflow => return FFFF
+	call	nmIncResult			;Yes => still waiting, increment result
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin and compare with desired state
+	snz					;Match ?
+	jmp	:Time				;Yes => test again
+	jmp	nmReturnData			;No  => complete, return and indicate data
+
+; ==============================================================================
+;  RCTime(Timeout, PortPin, State): Time
+; ==============================================================================
+;  Description:
+;      Times the length of time it takes for the pin to match the state parameter
+;      (in 4.34us units). Returns $FFFF (-1) if timeout occurs.
+;      Sets PortPin to be an input.
+;      Maximum initial delay of 4.34us prior to first testing pin, pin then tested
+;      every 4.34us
+;  Parameters:
+;      Timeout = Maximum time to wait for (in 4.34us units)
+;      PortPin: Bit    8 = 0/1 for Port0/Port1
+;               Bits 7:0 = bitmask of the desired pin (1 of 8 a '1')
+;      State = level required to stop the timer
+;  Result = Time measured in 4.34us units [0:65535]
+; ==============================================================================
+
+nmRCTimeTimeoutH	=	nmBlockTimeoutH		;1st Parameter = Timeout
+nmRCTimeTimeoutL	=	nmBlockTimeoutL		;1st Parameter = Timeout
+nmRCTimePort		=	nmBlockPort		;2nd Parameter = Port/Pin
+nmRCTimePin		=	nmBlockPin		;2nd Parameter = Port/Pin
+nmRCTimeState		=	nmBlockState		;3rd Parameter = State
+
+nm_jstamp_core_CPU_rctime
+	mov	FSR, #nmRCTimePort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinIn			;Make pin an input
+	call	nmInitResultAndTimeout
+	clrb	nmInterruptFlag
+:Loop	call	nmDecTimeout
+	snz
+	jmp	nmReturnFFFF			;Overflow => return FFFF
+	call	nmIncResult			;increment result
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin and compare with desired state
+	sz					;Match ?
+	jmp	:Loop				;No  => try again
+	jmp	nmReturnData			;Yes => return and indicate data
+
+; ==============================================================================
+;  Count(Timeout, PortPin, Edge): Count
+; ==============================================================================
+;  Description:
+;      Counts the number of 010 or 101 transitions that occur in the given time
+;      Returns 0 for no pulses detected.
+;      Sets PortPin to be an input.
+;      Max delay of 4.34us priot to first reading pin. Pin then tested every 4.34us.
+;      A pulse of less than 4.34us may be missed
+;  Parameters:
+;      Timeout = Maximum time to test for (in 4.34us units)
+;      PortPin: Bit    8 = 0/1 for Port0/Port1
+;               Bits 7:0 = bitmask of the desired pin (1 of 8 a '1')
+;      Edge:    1 = rising edge, 0 = falling edge
+;  Result = Number of pulses detected [0:65535]
+; ==============================================================================
+
+nmCountTimeoutH		=	nmBlockTimeoutH		;1st Parameter = Timeout
+nmCountTimeoutL		=	nmBlockTimeoutL		;1st Parameter = Timeout
+nmCountPort		=	nmBlockPort		;2nd Parameter = Port/Pin
+nmCountPin		=	nmBlockPin		;2nd Parameter = Port/Pin
+nmCountEdge		=	nmBlockState		;3rd Parameter = Edge
+
+nm_jstamp_core_CPU_count
+	mov	FSR, #nmCountPort		;Change to blocking bank (FSR pointing to port select)
+	call	nmSetPinIn			;Make pin an input
+	call	nmInitResultAndTimeout		;Prepare timeout and init result to 0
+	clrb	nmInterruptFlag			;Prepare to wait for next interrupt
+:Init	call	nmDecTimeout			;Check time
+	snz					;Timeout ?
+	jmp	nmReturnData			;Yes => return and indicate data
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin
+	sz					;Match ?
+	jmp	:LoopB				;No  => Wait for match
+:LoopA	call	nmDecTimeout			;Check time
+	snz					;Timeout ?
+	jmp	nmReturnData			;Yes => return and indicate data
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin
+	snz					;Match?
+	jmp	:LoopA				;Yes => Same, waiting for mismatch
+:LoopB	call	nmDecTimeout			;Check time
+	snz					;Timeout ?
+	jmp	nmReturnData			;Yes => return and indicate data
+	call	nmInterruptSync			;Wait for next interrupt
+	call	nmTestPin			;Read pin
+	sz					;Match ?
+	jmp	:LoopB				;No  => Same, waiting for match
+	call	nmIncResult			;Yes => edge found, increment result
+	jmp	:LoopA				;Wait for next pulse
+
+; ==============================================================================
+;  PeriphUninstall(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Removes peripherial from ISR
+;      Warning: Does not affect pins, user must set pin to the desired idle state
+;               (eg in/low/high) after calling this routine.
+;  Parameters:
+;      PeripherialBank: Bank
+; ==============================================================================
+
+nmPeriphBank	=	nmBlockBank + $1	;1st parameter = bank
+
+nm_jstamp_core_CPU_uninstall
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	mov	nmPeriphISRVec, nmPeriphRetVec	;Apply new ISR vector
+	jmp	nmReturnNone			;Indicate no result
+
+; ==============================================================================
+;  TimerInstall(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Installs the timer VP.
+;  Parameters:
+;      None.
+; ==============================================================================
+
+nm_jstamp_core_Timer_init
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	mov	nmPeriphISRVec, #nmTimer
+	jmp	nmReturnNone
+
+; ==============================================================================
+;  install(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Installs the any VP.
+;  Parameters:
+;      PeripherialBank: VP address.
+; ==============================================================================
+
+nmPeriphAddress	=	nmBlockBank + $1	;1st parameter = bank
+
+nm_jstamp_core_CPU_install
+	mov	OP_LSB,nmPeriphAddress
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	mov	nmPeriphISRVec, OP_LSB
+	jmp	nmReturnNone
+
+; ==============================================================================
+;  UartTxInit(PeripheralBank)
+;  UartRxInit(PeripheralBank)
+;  UartRxUpdate(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      TxInit:   Installs Tx ISR (peripherial registers must be set prior to calling)
+;                Sets Data pin to be an output and HS pin to be an input
+;      RxInit:   Installs Rx ISR (peripherial registers must be set prior to calling)
+;                Sets Data pin to be an input and HS pin to be an output
+;      RxUpdate: Update handshaking (call directly after updating tail pointer after reading buffer)
+;  Parameters:
+;      PeripherialBank: Bank
+; ==============================================================================
+
+nm_jstamp_core_Uart_txInit
+	call	nmUartInitCommon		;Init buffer, divide, and pointers, FSR pointing to HS pin
+	call	nmSetPinIn			;Set HS pin as an input
+	mov	w, #(nmUartPort-nmUartHSPort)	;add to FSR to point to data port
+	add	FSR, w				;Same bank but FSR pointing to nmUartPort
+	sb	nmUartInvert.0			;Invert data ?
+	call	nmSetPinHigh			;No => pin should be high
+	snb	nmUartInvert.0			;Invert data ?
+	call	nmSetPinLow			;Yes => pin should be low
+	call	nmSetPinOut			;Set data pin to be an output
+	mov	nmPeriphISRVec, #nmUartTxIdle	;Apply new ISR vector
+	jmp	nmReturnNone			;Indicate no result
+
+nm_jstamp_core_Uart_rxInit
+	call	nmUartInitCommon		;Init buffer, divide, and pointers
+	sb	nmUartInvert.1			;HS invert true ?
+	call	nmSetPinLow			;No => HS = 0 (go)
+	snb	nmUartInvert.1			;HS invert true ?
+	call	nmSetPinHigh			;Yes => HS = 1 (go)
+	call	nmSetPinOut			;Set HS as an output
+	mov	w, #(nmUartPort-nmUartHSPort)	;add to FSR to point to data port
+	add	FSR, w				;Same bank but FSR pointing to nmUartPort
+	call	nmSetPinIn			;Set data pin as an input
+	mov	nmPeriphISRVec, #nmUartRxIdle	;Apply new ISR vector
+	jmp	nmReturnNone
+
+nm_jstamp_core_Uart_rxUpdate
+nm_jstamp_core_Uart_rxRead
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	mov	w, #(nmUartHSPort & %00001111)	;w = offset of HSPort
+	add	FSR, w				;Same bank but FSR pointing to nmUartHSPort
+	mov	w, nmUartHead			;1
+	mov	w,nmUartTail-w
+	jz	:hs
+	and	w,#%11110000
+	jnz	:hs
+	jmp	nmReturnNone			;Yes => do not change handshaking pin
+:hs	sb	nmUartInvert.1			;No  => indicate GO on HS pin, HS invert true ?
+	call	nmSetPinLow			;No => HS = 0 (go)
+	snb	nmUartInvert.1			;HS invert true ?
+	call	nmSetPinHigh			;Yes => HS = 1 (go)
+	jmp	nmReturnNone
+
+_nmUartInitCommon
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	add	nmUartBufferL, #4		; Add 4 to the buffer pointer to skip
+	snc					; over the object pointer and length.
+	inc	nmUartBufferH
+	mov	nmUartDivide, nmUartBaud	;Init divide count
+	clr	nmUartHead			;Reset data pointers
+	clr	nmUartTail			;Reset data pointers
+	mov	w, #(nmUartHSPort & %00001111)	;w = offset of HSPort
+	add	FSR, w				;Same bank but FSR pointing to nmUartHSPort
+	jmp	nmReturnNone
+
+;-------------------------------------------------------------------------------
+; Subroutine: nm_jstamp_core_writeSRAM
+;             nm_jstamp_core_readSRAM
+;
+; Read or write bytes to the SRAM.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+nmBlockAddrH	=	nmBlockBank + $0	;1st Parameter = Address
+nmBlockAddrL	=	nmBlockBank + $1	
+nmBlockData	=	nmBlockBank + $3	;2nd Parameter = Value
+
+nm_jstamp_core_writeSRAM
+	mov	SRAMAddressMSB,nmBlockAddrH
+	mov	SRAMAddressLSB,nmBlockAddrL
+	mov	w,nmBlockData	; Get the value.
+	call	@SRAMWrite	; Save it.
+	jmp	@nmReturnNone
+
+nm_jstamp_core_readSRAM
+	mov	SRAMAddressMSB,nmBlockAddrH
+	mov	SRAMAddressLSB,nmBlockAddrL
+	call	@SRAMRead	; Read it.
+	mov	OP_LSB,w	; Load the value.
+	clr	OP_MSB
+	jmp	@nmReturnData
+
+
+; ==============================================================================
+;  Nap(Prescale)
+; ==============================================================================
+;  Description:
+;      Sleep for a period of time based on the prescaler.
+;  Parameters:
+;      Prescale = %000 - %111
+; ==============================================================================
+
+nmPrescale	=	nmBlockTimeoutL		;1st Parameter = Timeout
+
+nm_jstamp_core_CPU_nap
+	bank	nmBlockBank			;Change to blocking bank (FSR pointing to port select)
+	mov	w,nmPrescale
+	and	w,#%00000111			;Mask out the high bits.
+	or	w,#%10011000			;Update the timeout.
+	mov	!option,w
+	call	@nmSleep			;Perform the sleep.
+	jmp	@nmReturnNone			;Yes => Complete
+
+org	$C00
+nmSleep
+	; Save the IO directions.
+	mov	w, #$0F				;1	Prepare to read DDR
+	mov	m, w				;1	Prepare to read DDR
+	mov	!nmPort0, w			;1	w = DDR
+	mov	OP_LSB, w
+	mov	!nmPort1, w			;1	w = DDR
+	mov	OP_MSB, w			;1	Store DDR in temp variable
+	sleep
+	; Never returns, return is done on startup.
+	
+
+;**************************************************************************
+; Debugger subroutines
+;**************************************************************************
+
+	org	$C10
+;
+; The debugger runs at 57,600 baud.
+;
+; For debugger commands see the C++ documentation.
+
+version		=	$50	; Current firmware version
+
+debugFlag	=	$7E	; Packet start flag.
+debugEscape	=	$7D	; Transparency escape character.
+debugXor	=	$20	; Value xored with escaped characters.
+debugFlow	=	$18	; Signal we are ready to receive.
+debugInterrupt	=	$19	; Signal an error message.
+
+comNone		=	0	; No command.
+comStatus	=	1	; Request status infomation.
+comReset	=	2	; Reset
+comStep		=	3	; Step
+comRun		=	4	; Run
+comError	=	5	; Error (next byte holds error number).
+comStop		=	6	; Stop
+comStack	=	7	; Dump the stack.
+comConfig	=	8	; Send the SX's configuration.
+comHeap		=	9	; Dump the heap.
+comBreakpoints	=	10	; Download breakpoints.
+comProgram	=	11	; Program the EEPROM.
+comDownloadOK	=	12	; Is a download OK?
+comStepDone	=	13	; Step is complete
+comAtn		=	14	; Attention. Tell the IDE we are ready.
+comStartLoad	=	15	; Starting the SRAM shadowing
+comTerminalQuery =	17	; Check for data from the terminal.
+comTerminalData	=	18	; Data follows.
+comTerminalNoData =	19	; No data follows.
+
+; The endload character is used to signify the version of the firmware.
+comEndLoad	=	version	; Finished the SRAM shadowing
+
+com
+
+comMax		=	comStartLoad
+
+errNone		=	0
+errUnknownOp	=	1
+errBreakpoint	=	2
+errMessage	=	3
+errException	=	4	; Unhandled exception.
+errEnd		=	5	; End of program reached.
+
+debugReplyBit	=	(1<<7)	; Bit to be set for replies.
+
+debugStateStop	=	0	; The debugger is stopped.
+debugStateRun	=	1	; The debugger is running.
+debugStateJog	=	2	; The debugger is jogging.
+debugStateRunRun =	3	; The program is running without the debugger.
+debugStateUnknownOp =	4	; An unknown opcode was encountered.
+debugStateStep	=	5	; Currently executing a single step.
+
+DebuggerPage	=	$
+
+IF JVMDebug = 1
+; Decode a debugger command
+_DebuggerLoop
+	bank	debugger
+	mov	opcode,w	; Save the opcode
+	cje	debugState,#debugStateRunRun,:nextop	; Check if the debugger is running at all.
+	cse	debugState,#debugStateStep	; Check if the debugger is stepping.
+	jmp	:start
+	mov	w,#(comStepDone|debugReplyBit)	; Indicate the step is finished
+	call	@DebugSendReply
+	mov	debugState,#debugStateStop
+
+:start	clr	wdt
+	call	@DebugRxCommandStart
+	page	$
+	jmp	pc+w		; Jump table based on the command.
+	jmp	:done		; comNone
+	jmp	:status		; comStatus
+	jmp	:reset		; comReset
+	jmp	:step		; comStep
+	jmp	:run		; comRun
+	jmp	:error		; comError
+	jmp	:stop		; comStop
+	jmp	:stack		; comStack
+	jmp	:config		; comConfig
+	jmp	:heap		; comHeap
+	jmp	:breakpoints	; comBreakpoints
+	jmp	:program	; comProgram
+	jmp	:downloadOK	; comDownloadOK
+	jmp	:done		; comStepDone
+	jmp	:done		; comAtn
+	jmp	:done		; comStartLoad
+	jmp	:done		; comEndLoad
+
+:downloadOK
+	test	debugState		; Is the debugger stopped?
+	sz
+	jmp	:done			; No, don't allow download.
+	mov	w,#(comDownloadOK|debugReplyBit)
+	call	@DebugSendReply
+	jmp	:done		; Execute the opcode.
+
+:status
+	; Generate the reply packet.
+	clr	debugChecksum
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	mov	w,#(comStatus|debugReplyBit)
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_PC_LSB
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_PC_MSB
+	call	@DebugSendByte
+	mov	w,DebugState	; Load the debugger status.
+	call	@DebugSendByte
+	mov	w,opcode
+	call	@DebugSendByte
+	not	debugChecksum
+	mov	w,++debugChecksum ; Load the complement of the checksum.
+	call	@DebugSendByte	 ; Send the checksum.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	jmp	:comDone
+
+:config
+	; Generate the reply packet.
+	clr	debugChecksum
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	mov	w,#(comConfig|debugReplyBit)
+	call	@DebugSendByte
+	mov	w,#(kMemSize&$00FF)	; LSB of the memory size.
+	call	@DebugSendByte
+	mov	w,#(kMemSize&$FF00)>>8	; MSB of the memory size.
+	call	@DebugSendByte
+	mov	w,#(kProgSize&$00FF)	; LSB of the program size.
+	call	@DebugSendByte
+	mov	w,#(kProgSize&$FF00)>>8	; MSB of the program size.
+	call	@DebugSendByte
+	mov	w,#(JVM_HEAP_BASE&$00FF)	; LSB of the heap base.
+	call	@DebugSendByte
+	mov	w,#(JVM_HEAP_BASE&$FF00)>>8 ; MSB of the heap base.
+	call	@DebugSendByte
+	not	debugChecksum
+	mov	w,++debugChecksum ; Load the complement of the checksum.
+	call	@DebugSendByte	 ; Send the checksum.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	jmp	:comDone
+
+:reset
+	mov	w,#(comReset|debugReplyBit)
+	call	@DebugSendReply
+:doReset
+:wait	test	tx_count	; Wait for transmit to finish.
+	jnz	:wait
+	bank	serial
+	clrb	rx_flag
+	jmp	@ReInit		; This used to be Init
+
+:step
+	mov	debugState,#debugStateStep	; Change to running state.
+	mov	w,#(comStep|debugReplyBit)
+	call	@DebugSendReply
+	jmp	:nextop		; Execute the opcode.
+
+:run
+	mov	w,#(comRun|debugReplyBit)
+	call	@DebugSendReply
+	mov	debugState,#debugStateRun	; Change to running state.
+	jmp	:nextop		; Execute the opcode.
+
+:stop
+	mov	w,#(comStop|debugReplyBit)
+	call	@DebugSendReply
+	mov	debugState,#debugStateStop	; Change the state to stopped.
+	jmp	:done		; Execute the opcode.
+
+:stack
+	clr	debugChecksum		; Intialise the checksum.
+	; Generate the reply packet.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	mov	w,#(comStack|debugReplyBit)
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_SP_LSB
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_SP_MSB
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_FP_LSB
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_FP_MSB
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_METHOD_LSB
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_METHOD_MSB
+	call	@DebugSendByte
+
+	; Send bytes.
+	bank	OffsetVars
+	mov	OP_LSB,JVM_SB_LSB
+	mov	w,JVM_SB_MSB
+	bank	JVMVars
+	mov	SRAMAddressMSB,w
+	mov	SRAMAddressLSB,OP_LSB
+:sloop 	call	@SRAMRead
+	call	@DebugSendByte
+	bank	JVMVars
+	INC_SRAM_ADDRESS
+	nop				; Prevent write - read cycle.
+	cjb     SRAMAddressLSB,JVM_SP_LSB,:sloop
+	cjb     SRAMAddressMSB,JVM_SP_MSB,:sloop
+
+	bank	debugger
+	not	debugChecksum
+	mov	w,++debugChecksum ; Load the complement of the checksum.
+	call	@DebugSendByte	 ; Send the checksum.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	jmp	:comDone
+
+:heap
+	; Read the parameters first to prevent flow control problems
+	call	@DebugGetByte		; Read the MSB of the start.
+	mov	OP2_MSB,w
+	call	@DebugGetByte		; Read the LSB of the start.
+	bank	JVMVars
+	mov	SRAMAddressLSB,w
+	mov	SRAMAddressMSB,OP2_MSB
+	call	@DebugGetByte		; Read the MSB of the length.
+	mov	OP2_MSB,w
+	call	@DebugGetByte		; Read the LSB of the length.
+	mov	OP2_LSB,w
+	clr	debugChecksum		; Intialise the checksum.
+	; Generate the reply packet.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	mov	w,#(comHeap|debugReplyBit)
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_HP_MSB		; Send the heap pointer.
+	call	@DebugSendByte
+	bank	JVMVars
+	mov	w,JVM_HP_LSB
+	call	@DebugSendByte
+	bank	JVMVars
+:hloop	call	@SRAMRead		; Read the byte.
+	call	@DebugSendByte	 	; Send it.
+	bank	JVMVars
+	INC_SRAM_ADDRESS
+	decsz	OP2_LSB
+	jmp	:hloop
+	test	OP2_MSB
+	snz
+	inc	OP2_MSB
+	decsz	OP2_MSB
+	jmp	:hloop
+	not	debugChecksum
+	mov	w,++debugChecksum ; Load the complement of the checksum.
+	call	@DebugSendByte	 ; Send the checksum.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	jmp	:comDone
+
+:breakpoints
+	; Load the breakpoints
+	call	@DebugGetByte	; Get the number of breakpoints.
+	bank	BPVars
+	mov	JVM_BP_COUNT,w	; The number of breakpoints. Not sanity checked.
+	mov	dTemp0,w
+	clc			; Clear the carry flag.
+	rl	dTemp0		; Multiply the number of bps by 2.
+	test	dTemp0		; Is the number of breakpoints zero?
+	snz
+	jmp	:bdone		; Yes. We're done.
+	mov	dTemp1,#JVM_BP
+:bloop	call	@DebugGetByte	; Load the breakpoints into RAM.
+	mov	SCRATCH0,w
+	mov	FSR,dTemp1
+	mov	INDF,SCRATCH0
+	inc	dTemp1
+	decsz	dTemp0
+	jmp	:bloop
+:bdone	call	@DebugGetByte		; Read the checksum
+	clr	debugChecksum		; Intialise the checksum.
+	mov	w,#(comBreakpoints|debugReplyBit)
+	call	@DebugSendReply
+	jmp	:comDone
+
+:program
+	call	@DebugGetByte	; Read the program flag.
+	test	w
+	snz
+	jmp	:noinit
+	bank	i2c
+	mov	i2c_address_LSB,#(kProgramStart&$00ff) ; Initialise the address.
+	mov	i2c_address_MSB,#(kProgramStart&$ff00)>>8
+:noinit
+	; Read the 16 bytes.
+	mov	dTemp0,#16
+	mov	dTemp1,#TempVars
+:rloop	call	@DebugGetByte	; Read bytecode.
+	mov	SCRATCH0,w
+	mov	FSR,dTemp1
+	mov	INDF,SCRATCH0	; Save the byte.
+	inc	dTemp1
+	decsz	dTemp0
+	jmp	:rloop
+	call	@DebugValidChecksum	; Read the checksum.
+	; Should check the checksum here.
+	mov	dTemp0,#16
+	mov	dTemp1,#TempVars
+:ploop	clr	wdt
+	bank	JVMVars
+	mov	FSR,dTemp1
+	mov	w,INDF		; Load the byte.
+	_bank	i2c
+	call	@i2c_write
+	inc	dTemp1
+	inc	i2c_address_LSB
+	snz
+	inc	i2c_address_MSB
+	decsz	dTemp0
+	jmp	:ploop
+	mov	w,#(comProgram|debugReplyBit)
+	call	@DebugSendReply
+	jmp	:done
+
+:error
+	; Not implemented.
+:comDone
+
+
+:done	cje	DebugState,#debugStateStop,:start	; If we are stopped loop again.
+	; If we are running, check the breakpoints.
+	bank	JVMVars
+	mov	OP2_MSB,JVM_PC_MSB	; Copy the PC into a global variable.
+	mov	OP2_LSB,JVM_PC_LSB
+	test	OP2_LSB			; Correct for that fact that we already
+	snz				; incremented the PC.
+	dec	OP2_MSB
+	dec	OP2_LSB
+	bank	BPVars
+	test	JVM_BP_COUNT
+	snz				; Is the number of breakpoints zero?
+	jmp	:nextop			; Yes, continue.
+	mov	dTemp0,JVM_BP_COUNT
+	mov	FSR,#JVM_BP
+:cloop	cjne	INDF,OP2_LSB,:next2
+	inc	FSR
+	cjne	INDF,OP2_MSB,:next
+	bank	debugger
+	mov	DebugState,#debugStateStop ; Stop the debugger.
+	mov	w,#errBreakpoint
+	call	@DebugSendMessage
+	jmp	:start
+
+:next2	inc	FSR
+:next	inc	FSR
+	decsz	dTemp0
+	jmp	:cloop
+	; Intentionally fall through.
+:nextop	bank	debugger
+	mov	w,opcode		; Reload the opcode and execute it.
+	bank	JVMVars
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: DebugValidChecksum
+;
+; Receive the next byte which should be the checksum. If the sum of the received
+; bytes (including the checksum but excluding the flag characters) is zero then
+; the packet is valid.
+;
+; W on entry: -
+; W on exit : The zero flag is set if the packet is valid, cleared otherwise.
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_DebugValidChecksum
+	call	@DebugGetByte	; Receive the checksum.
+	mov	w,debugChecksum	; Set the flag if checksum is zero.
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: DebugRxCommandStart
+;
+; Receive the start of a command. If there is no byte in the receive queue return
+; immediately with no command. Otherwise wait until a vaild command is read.
+;
+; W on entry: -
+; W on exit : The command byte.
+; Variables : dTemp0
+;-------------------------------------------------------------------------------
+
+_DebugRxCommandStart
+	bank	serial
+	mov	w,#comNone		; Set no command by default.
+	sb	rx_flag			; Has a byte been received?
+	retp				; No, return
+	clr	debugChecksum		; Intialise the checksum.
+:readCom
+	call	@DebugGetByte		; Read the byte.
+	mov	dTemp0,w
+	cjbe	dTemp0,#comMax,:validCommand
+	mov	w,#comNone
+	retp
+:validCommand
+	mov	w,dTemp0
+	retp
+
+
+; Initialise the debugger
+_DebugInit
+	bank	debugger
+	mov	DebugState,#debugStateStop	; Initialise the state
+	retp
+
+; Get byte via serial port
+_DebugGetByte
+	_bank	debugger
+:loop1	clr	wdt			; Clear the watchdog.	
+	jnb	rx_flag,:loop1		; Wait for a byte.
+	clrb	rx_flag
+	cjne	rx_byte,#debugEscape,:checksum
+:loop2	clr	wdt			; Clear the watchdog.	
+	jnb	rx_flag,:loop2		; Wait for a byte.
+	clrb	rx_flag
+	xor	rx_byte,#debugXor	; Xor the escaped byte.
+:checksum
+	mov	w,rx_byte
+	add	debugChecksum,w		; Add the byte into the checksum.
+	retp
+
+; Send byte via serial port
+_DebugSendByte
+	bank	debugger
+	add	debugChecksum,w		; Accumulate the checksum
+	mov	dTemp0,w			; Save w
+	cje	dTemp0, #DebugFlag, :trans	; Compare to the flag sequence
+	cje	dTemp0, #DebugEscape,:trans	; Compare to the control escape
+	mov	w,dTemp0			; Reload byte to transmit
+	jmp	_DebugSendByteNoTrans		; No transparency issues
+:trans	mov	w, #DebugEscape		; Transmit the control escape
+	call	@DebugSendByteNoTrans
+	mov	w,dTemp0		; Reload byte to transmit
+	xor	w,#DebugXor		; Xor it.
+_DebugSendByteNoTrans
+	bank	debugger
+:wait	clr	wdt			; Clear the watchdog.	
+	test	tx_count		;wait for not busy
+	jnz	:wait
+	not	w			;ready bits
+	mov	tx_high,w
+	clrb	tx_low.6		; Pre start bit.
+	setb	tx_low.7
+	mov	tx_count,#11		;1 start + 8 data + 1 stop bit
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: DebugSendReply
+;
+; Send a reply packet.
+;
+; W on entry: The command to send.
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_DebugSendReply = _DebugSendByteNoTrans
+
+_DebugUnknownOpcode
+	bank 	debugger
+	mov	opcode,w	; Save the opcode
+	mov	debugState,#debugStateStop
+	mov	w,#errUnknownOp
+	call	@DebugStartMessage
+	bank 	debugger
+	mov	w,opcode
+	call	@DebugSendByte
+	call	@DebugEndMessage
+	jmp	@_DebuggerLoop
+
+_DebugStartMessage
+	bank	debugger
+	mov	dTemp1,w		; Save the byte to send.
+	cse	debugState,#debugStateStep	; Check if the debugger is stepping.
+	jmp	@:start
+	mov	w,#(comStepDone|debugReplyBit)	; Indicate the step is finished
+	call	@DebugSendReply
+:start	mov	debugChecksum,#0	; Initialise the checksum.
+	mov	w,#comError		; Indicate this is a message packet.
+	call	@DebugSendByteNoTrans
+	mov	w,dTemp1
+	call	@DebugSendByteNoTrans
+	bank	JVMVars
+	retp
+
+_DebugEndMessage
+	bank 	debugger
+	not	debugChecksum
+	mov	w,++debugChecksum 	; Load the complement of the checksum.
+;	call	@DebugSendByte	 	; Send the checksum.
+	mov	w,#debugFlag
+	call	@DebugSendByteNoTrans
+	bank	JVMVars
+	retp
+
+
+_DebugSendMessage
+	call	@DebugStartMessage
+	jmp	@_DebugEndMessage
+
+ENDIF
+
+org	$e00
+
+;--------------------------------------------------------------------------
+; Subroutine jump table
+;--------------------------------------------------------------------------
+
+JVMEnterVirtualMethod	jmp	@_JVMEnterVirtualMethod
+JVMEnterMethod	jmp	@_JVMEnterMethod
+JVMStubMethod	jmp	@_JVMStubMethod
+JVMReturnVal	jmp	@_JVMReturnVal
+JVMReturn	jmp	@_JVMReturn
+JVMCheckArray	jmp	@_JVMCheckArray
+JVMCheckObject	jmp	@_JVMCheckObject
+JVMCheckMemory	jmp	@_JVMCheckMemory
+JVMThrow	jmp	@_JVMThrow
+
+NativeMethodDispatch	jmp	@_NativeMethodDispatch
+InitHeapMemory	jmp	@_InitHeapMemory
+do_new		jmp	@_do_new
+nmIsrCreate	jmp	@_nmIsrCreate
+
+DoSub		jmp	@_DoSub
+DoAdd		jmp	@_DoAdd
+DoDiv		jmp	@_DoDiv
+
+IF JVMDebug = 1
+; Debugger
+DebugInit		jmp	@_DebugInit
+DebuggerLoop		jmp	@_DebuggerLoop
+DebugUnknownOpcode	jmp	@_DebugUnknownOpcode
+DebugSendByte		jmp	@_DebugSendByte
+DebugSendByteNoTrans	jmp	@_DebugSendByteNoTrans
+DebugGetByte		jmp	@_DebugGetByte
+DebugRxCommandStart	jmp	@_DebugRxCommandStart
+DebugValidChecksum	jmp	@_DebugValidChecksum
+DebugSendReply		jmp	@_DebugSendReply
+DebugSendMessage	jmp	@_DebugSendMessage
+DebugStartMessage	jmp	@_DebugStartMessage
+DebugEndMessage		jmp	@_DebugEndMessage
+ENDIF
+
+;**************************************************************************
+; Utility functions
+;**************************************************************************
+
+; Push a word onto the stack. The word should be in OP_LSB and OP_MSB. The
+; MSB is pushed first.
+JVMPush
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Set the SRAM address.
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	mov	w,OP_MSB	; Load the MSB.
+	call	@SRAMWrite	; Save it to the SRAM.
+	INC_SRAM_ADDRESS	; Increment the SRAM address.
+	mov	w,OP_LSB	; Load the LSB.
+	call	@SRAMWrite	; Save it to the SRAM.
+	add	JVM_SP_LSB,#2	; Increment the stack pointer, twice.
+	snc
+	inc	JVM_SP_MSB
+	call	@JVMCheckMemory	; Check for memory overflow.
+	retp
+
+JVMPush2
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Set the SRAM address.
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	mov	w,OP2_MSB	; Load the MSB.
+	call	@SRAMWrite	; Save it to the SRAM.
+	INC_SRAM_ADDRESS	; Increment the SRAM address.
+	mov	w,OP2_LSB	; Load the LSB.
+	call	@SRAMWrite	; Save it to the SRAM.
+	add	JVM_SP_LSB,#2	; Increment the stack pointer, twice.
+	snc
+	inc	JVM_SP_MSB
+	call	@JVMCheckMemory	; Check for memory overflow.
+	retp
+
+
+; Pop a word from the stack into OP_LSB and OP_MSB
+JVMPop
+	DEC_SP
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Set the SRAM address.
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	call	@SRAMRead	; Read the value from the SRAM.
+	mov	OP_LSB,w	; Save in LSB
+	DEC_SRAM_ADDRESS
+	call	@SRAMRead	; Read the value from the SRAM.
+	mov	OP_MSB,w	; Save in MSB
+	DEC_SP
+	retp
+
+; Pop a word from the stack into OP2_LSB and OP2_MSB
+JVMPop2
+	DEC_SP
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Set the SRAM address.
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	call	@SRAMRead	; Read the value from the SRAM.
+	mov	OP2_LSB,w	; Save in LSB
+	DEC_SRAM_ADDRESS
+	call	@SRAMRead	; Read the value from the SRAM.
+	mov	OP2_MSB,w	; Save in MSB
+	DEC_SP
+	retp
+
+; Push a byte onto the JVM stack. Preserves W.
+JVMPushByte
+	mov	SCRATCH1,w	; Save the value to push
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Set the SRAM address.
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	mov	w,SCRATCH1	; Load the value again
+	call	@SRAMWrite
+	INC_SP			; Increment the stack pointer
+	call	@JVMCheckMemory	; Check for memory overflow.
+	retp
+
+; Macro to pop a byte from the JVM stack.
+JVMPopByte
+	DEC_SP
+	mov	SRAMAddressMSB,JVM_SP_MSB	; Set the SRAM address.
+	mov	SRAMAddressLSB,JVM_SP_LSB
+	call	@SRAMRead	; Load the value from the SRAM.
+	retp
+
+; Add a 2 byte offset to the PC. The offset is in the
+; next two bytes of the instruction.
+JVMOffsetPC
+	call 	JVMGetOpcode	; Get MSB of offset
+	mov	OP_MSB,w	; Save it.
+	call 	JVMGetOpcode	; Get LSB of offset
+	add	JVM_PC_LSB,w	; Increment the low LSB
+	snb	C		; Check for carry
+	inc	JVM_PC_MSB	; Increment MSB if overflow
+	add	JVM_PC_MSB,OP_MSB ; Increment the PC MSB
+	sub	JVM_PC_LSB,#3	; Compensate for two increments
+	sc			; by decrementing again
+	dec	JVM_PC_MSB
+	retp
+
+;--------------------------------------------------------------------------
+; JVMGetOpcode
+;
+; Read the bytecode specified by the program counter.
+;--------------------------------------------------------------------------
+
+IFDEF EEPROMFETCH
+JVMEERead
+	mov	w,EEAddressMSB
+	bank	i2c
+	mov	i2c_address_MSB,w
+	bank	JVMVars
+	mov	w,EEAddressLSB
+	bank	i2c
+	mov	i2c_address_LSB,w
+	call	@i2c_Read
+	bank	JVMVars
+	retp
+ELSE
+JVMEERead = SRAMRead
+ENDIF
+
+JVMGetOpcode
+IFDEF EEPROMFETCH
+	mov	w,JVM_PC_MSB
+	bank	i2c
+	mov	i2c_address_MSB,w
+	bank	JVMVars
+	mov	w,JVM_PC_LSB
+	bank	i2c
+	mov	i2c_address_LSB,w
+	call	@i2c_Read
+	bank	JVMVars
+ELSE
+	mov	SRAMAddressMSB,JVM_PC_MSB
+	mov	SRAMAddressLSB,JVM_PC_LSB
+	call	@SRAMRead
+ENDIF
+	INC_PC
+	retp
+
+;-------------------------------------------------------------------------------
+; Subroutine: JVMThrow
+;
+; Throw a VM exception. The exception is thrown by calling a library routine
+; which decodes the exception number and then throws an exception instance
+; which was instantiated at JVM startup. This way, throwing an exception doesn't
+; require memory to be allocated.
+;
+; This routine never returns.
+;
+; W on entry: The exception number to be thrown.
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+_JVMThrow
+	mov	OP_LSB,w	; Save the exception number.
+	clr	OP_MSB
+	call	JVMPush	; Push the exception number on the stack.
+	mov	w,JVM_PC_MSB	; Load the MSB of the PC.
+	call	JVMPushByte	; Push it onto the stack.
+	mov	w,JVM_PC_LSB	; Load the LSB of the PC.
+	call	JVMPushByte	; Push it onto the stack.
+	bank	OffsetVars
+	mov	w,JVM_Throw_MSB	; Set the PC to the method stub.
+	bank	JVMVars
+	mov	JVM_PC_MSB,w
+	bank	OffsetVars
+	mov	w,JVM_Throw_LSB
+	bank	JVMVars
+	mov	JVM_PC_LSB,w
+	call	JVMPop		; Pop the old PC.
+	call	@JVMStubMethod	; Invoke the method.
+	NEXT_OP
+	; Never returns.
+
+;-------------------------------------------------------------------------------
+; Subroutine: Wake
+;
+; Wake up after a nap or sleep operation.
+;-------------------------------------------------------------------------------
+
+Wake	; Restore the DDR.
+	mov	w, OP_LSB
+	mov	!nmPort0, w			;1	w = DDR
+	mov	w, OP_MSB
+	mov	!nmPort1, w			;1	w = DDR
+	mov	!option,#%10011111	; Renable RTCC rollover. 
+	retp			; Return from the nmSleep routine.
+
+;**************************************************************************
+; Initialisation
+;
+;	This is the actual reset vector. It will be reached on power on
+;	and watchdog reset.
+;**************************************************************************
+
+DoInit	; Check for watchdog reset.
+	call	@IOInit
+	jb	to,:por
+	jnb	pd,Wake	; Sleep wakeup	
+
+	; Start power on reset.
+:por	call	@RAMInit	; Initialise RAM
+	call	@nmIsrCreate
+	call	@ProcInit	; Initialise the processor
+
+; Send a byte to indicate that we are starting the reload.
+	mov	w,#comStartLoad
+	call	@DebugSendReply
+
+	; We need to determine if the reset was caused by the programmer.
+	; If so then switch to debug mode to allow a new code download.
+	; Do this by waiting for at least one byte to be received on the serial input
+	; while we load the EEPROM into the SRAM.
+
+	; Load the EEPROM into the SRAM.
+	bank	JVMVars
+	clr	SRAMAddressMSB
+	clr	SRAMAddressLSB
+IFDEF FASTLOAD
+	bank	i2c
+	clr	i2c_address_msb
+	mov	i2c_address_lsb,#1
+	call	@I2C_Read		; Read the length.
+	mov	OP_LSB,w		; Save for later.
+	inc	OP_LSB
+	clr	i2c_address_lsb
+ELSE
+	mov	OP_LSB,#$A1
+ENDIF
+
+:loop	clr	wdt
+	call	@I2C_Read
+	bank	JVMVars
+	call	@SRAMWrite
+	inc	SRAMAddressLSB
+	snz
+	inc	SRAMAddressMSB
+	bank	i2c
+	inc	i2c_address_lsb
+	snz
+	inc	i2c_address_msb
+	cse	i2c_address_msb,OP_LSB
+	jmp	:loop
+
+; Send a byte to indicate that we have ended the reload.
+	mov	w,#comEndLoad
+	call	@DebugSendReply
+
+ReInit
+	call	@JVMInit	; Initialise the virtual machine
+IF JVMDebug
+	call	@DebugInit	; Initialise the debugger
+ENDIF
+
+	bank	JVMVars
+	call	@JVMGetOpcode	; Read the opcode.
+	mov	SCRATCH0,w
+	cje	SCRATCH0,#kRunMagic,:run
+	cje	SCRATCH0,#kDebugMagic,:run
+	cje	SCRATCH0,#kEndMagic,:debug
+	; The EEPROM is invalid. Jump to the debugger and wait for a download.
+:debugger
+	jmp	@DebuggerLoop
+
+:run
+:checkSerial
+	bank	serial
+	jnb	rx_flag,:runrun			; Has a byte been received?
+	csne	rx_byte,#comAtn
+	jmp	:debug
+
+:runrun	bank	debugger
+	mov	debugState,#debugStateRunRun
+:debug
+	bank	JVMVars
+	; Preload the class, method and table offsets.
+	mov	JVM_PC_LSB,#JEMClassOffset
+	mov	OP_MSB,#(LastOffsetVar-OffsetVars)
+	mov	OP_LSB,#JVM_Object_MSB
+:load	call	@JVMGetOpcode
+	mov	Scratch0,w
+	mov	fsr,OP_LSB
+	mov	INDF,Scratch0
+	inc	OP_LSB
+	bank	JVMVars
+	decsz	OP_MSB
+	jmp	:load
+	; Clear the heap memory.
+	bank	OffsetVars
+	mov	OP_MSB,JVM_SB_MSB
+	mov	w,JVM_SB_LSB
+	bank	JVMVars
+	mov	JVM_SP_LSB,w
+	mov	JVM_SP_MSB,OP_MSB
+	call	@InitHeapMemory
+	; Initialise the static fields.
+	mov	JVM_PC_LSB,#JEMSFOffset
+	call	@JVMGetOpcode
+	mov	OP2_LSB,w	; Save the length.
+	sub	JVM_HP_LSB,w	; Subtract the size of the fields from the heap pointer.
+	sc
+	dec	JVM_HP_MSB
+	mov	Scratch0, JVM_HP_MSB
+	mov	w, JVM_HP_LSB
+	bank	JVMVars2
+	mov	JVM_SF_LSB, w
+	mov	JVM_SF_MSB, Scratch0
+	bank	JVMVars
+	; Start the program.
+	mov	JVM_PC_LSB,#JEMMainOffset
+	call	@JVMEnterMethod	; Enter the main function
+	jmp	@JVMLoadOp	; Start the virtual machine
+
+ifndef SXDEBUG
+
+; ==============================================================================
+;  PwmInit(PeripheralBank)
+;  PwmSet(PeripheralBank, Value)
+; ==============================================================================
+;  Description:
+;      PwmInit: Installs PWM ISR (peripherial registers must be set prior to calling)
+;               Sets Data pin to be an output
+;      PwmSet:  Sets new value for next cycle
+;               Total cycle time = 255 * 4.34us = 1.1ms
+;               Value parameter = High time (0 = always low, 255 = always high)
+;               On time  = Value / 255 * 1.1ms
+;               Off time = (255-Value) / 255 * 1.1ms
+;               Average output = Value / 255 * Vdd
+;  Parameters:
+;      PeripherialBank: Bank
+;      Value: 8 bit unsigned number - See description
+; ==============================================================================
+
+nmPwmSetHighHi	=	nmBlockBank + $2	;2nd parameter = new value
+nmPwmSetHighLo	=	nmBlockBank + $3
+nmPwmSetLowHi	=	nmBlockBank + $4	;3rd parameter = new value
+nmPwmSetLowLo	=	nmBlockBank + $5
+nmPwmSetHighZero =	nmBlockBank + $7	;3rd parameter = new value
+nmPwmSetLowZero	=	nmBlockBank + $9
+
+nm_jstamp_core_PWM_install					;Parameters = nmPwmPeriphBankL
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	FSR, nmPwmPeriphBankL		;Change to given peripheral bank
+	mov	w, #(nmPwmPort & %00001111)	;w = offset of PwmPort
+	add	FSR, w				;Same bank but FSR pointing to nmPwmPort
+	call	@nmSetPinLow			;Clear output pin (INDF = Port)
+	call	@nmSetPinOut			;Make pin an output (INDF = Port)
+	mov	nmPeriphISRVec, #nmPwmUpdate	;Install ISR
+	jmp	@nmReturnNone
+
+nm_jstamp_PWM_updateInternal
+	mov	FSR, #nmBlockBank		;Block bank
+;	clrb	nmInterruptFlag	
+	call	@nmInterruptSync		;Sync with interrupt to prevent errors in update
+	mov	OP_MSB, nmPwmSetHighHi		;Get new values
+	mov	OP_LSB, nmPwmSetHighLo
+	mov	OP2_MSB, nmPwmSetLowHi
+	mov	OP2_LSB, nmPwmSetLowLo
+	mov	Scratch0, nmPwmSetHighZero
+	mov	Scratch1, nmPwmSetLowZero
+	mov	FSR, nmPeriphBank		;Change to given periph bank
+	mov	nmPwmHighTimeHi, OP_MSB 		;Set new values
+	inc	nmPwmHighTimeHi			; Ensure hi > 0.
+	mov	nmPwmHighTimeLo, OP_LSB
+	mov	nmPwmLowTimeHi, OP2_MSB
+	inc	nmPwmLowTimeHi			; Ensure hi > 0.
+	mov	nmPwmLowTimeLo, OP2_LSB
+	mov	nmPwmHighZero, Scratch0
+	mov	nmPwmLowZero, Scratch1
+	jmp	@nmReturnNone
+
+; ==============================================================================
+;  AdcInit(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Installs ISR (peripherial registers must be set prior to calling)
+;      Sets Pin to be an input
+;  Parameters:
+;      PeripherialBank: Bank
+; ==============================================================================
+
+nm_jstamp_core_ADC_install
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	mov	w, #(nmAdcInPort & %00001111)	;w = offset of IN pin
+	add	FSR, w				;Same bank but FSR pointing to nmUartHSPort
+	call	@nmSetPinIn			;Set HS pin as an input
+	mov	w, #(nmAdcOutPort-nmAdcInPort)	;add to FSR to point to OUT port
+	add	FSR, w				;Same bank but FSR pointing to nmAdcOutPort
+	call	@nmSetPinLow			;Init pin low
+	call	@nmSetPinOut			;Set pin as an output
+	clr	nmAdcValue			;Clear value
+	clr	nmAdcAcc			;Clear accumulator
+	clr	nmAdcCount			;Clear counter
+	mov	nmPeriphISRVec, #nmAdc		;Apply new ISR vector
+	jmp	@nmReturnNone
+
+
+; ==============================================================================
+;  FreqOut(Time, PortPin, Freq1, Freq2)
+; ==============================================================================
+
+nmFreqOutTimeH		=	nmBlockTimeoutH		;1st Parameter = Timeout
+nmFreqOutTimeL		=	nmBlockTimeoutL		;1st Parameter = Timeout
+nmFreqOutPort		=	nmBlockPort		;2nd Parameter = Port/Pin
+nmFreqOutPin		=	nmBlockPin		;2nd Parameter = Port/Pin
+nmFreqOutFreq1H		=	nmBlockBank + $4	;3rd Parameter = Freq1
+nmFreqOutFreq1L		=	nmBlockBank + $5	;3rd Parameter = Freq1
+nmFreqOutFreq2H		=	nmBlockBank + $6	;4th Parameter = Freq2
+nmFreqOutFreq2L		=	nmBlockBank + $7	;4th Parameter = Freq2
+
+nmFreqOutPwmValue1	=	nmBlockBank + $8	;The sample value of the sine wave
+nmFreqOutVelocity1	=	nmBlockBank + $9	;The velocity of the sin wave
+nmFreqOutAcc1H		=	nmBlockBank + $A
+nmFreqOutAcc1L		=	nmBlockBank + $B
+nmFreqOutPwmValue2	=	nmBlockBank + $C
+nmFreqOutVelocity2	=	nmBlockBank + $D	; The velocity of the sin wave
+nmFreqOutAcc2H		=	nmBlockBank + $E
+nmFreqOutAcc2L		=	nmBlockBank + $F
+
+nmFreqOutPwmAcc		=	nmResultL
+
+;nm_jstamp_core_CPU_outputSine
+;	mov	FSR, #nmFreqOutPort		;Block bank (pointing to Port parameter)
+;	call	@nmSetPinLow			;Init pin low
+;	call	@nmSetPinOut			;Make pin an output
+;	call	@nmInitResultAndTimeout		;Prepare timeout and init result to 0
+;	mov	w, #-6				;Center sine wave about 0
+;	mov	nmFreqOutPwmValue1, w		;Init value for zero crossing start
+;	mov	nmFreqOutPwmValue2, w		;Init value for zero crossing start
+;	mov	w, #-11				;-11 => span = 122 (-61 -> +60)
+;	mov	nmFreqOutVelocity1, w		;Init velocity for zero crossing start
+;	mov	nmFreqOutVelocity2, w		;Init velocity for zero crossing start
+;	clr	nmFreqOutAcc1H
+;	clr	nmFreqOutAcc1L
+;	clr	nmFreqOutAcc2H
+;	clr	nmFreqOutAcc2L
+;	clrb	nmInterruptFlag			;Prepare to wait for next interrupt
+;:Start	call	@nmDecTimeout			;Check the time
+;	snz					;Timeout (Time was 0) ?
+;	jmp	@nmReturnNone			;Yes => Complete
+;:Loop	call	@nmInterruptSync			;Wait for next interrupt
+;:Freq1	mov	w, nmFreqOutFreq1L		;advance sine at frequency
+;	add	nmFreqOutAcc1L, w		;advance sine at frequency
+;	mov	w, Status			;get c flag
+;	and	w, #%00000001			;mask out c flag (LSB)
+;	add	w, nmFreqOutFreq1H		;advance sine at frequency
+;	add	nmFreqOutAcc1H, w		;advance sine at frequency
+;	jnc	:Freq2
+;:Peak1	mov	w,++nmFreqOutVelocity1		;If sine wave is negative then accelerate
+;	sb	nmFreqOutPwmValue1.7		;Positve / Negative ?
+;	mov	w,--nmFreqOutVelocity1		;If sine wave is positive then decelerate
+;	mov	nmFreqOutVelocity1, w		;Store new velocity
+;	add	nmFreqOutPwmValue1, w		;Add the velocity to sin
+;:Freq2	mov	w, nmFreqOutFreq2L		;advance sine at frequency
+;	add	nmFreqOutAcc2L, w		;advance sine at frequency
+;	mov	w, Status			;get c flag
+;	and	w, #%00000001			;mask out c flag (LSB)
+;	add	w, nmFreqOutFreq2H		;advance sine at frequency
+;	add	nmFreqOutAcc2H, w		;advance sine at frequency
+;	jnc	:Output
+;:Peak2	mov	w,++nmFreqOutVelocity2		;If sine wave is negative then accelerate
+;	sb	nmFreqOutPwmValue2.7		;Positve / Negative ?
+;	mov	w,--nmFreqOutVelocity2		;If sine wave is positive then decelerate
+;	mov	nmFreqOutVelocity2, w		;Store new velocity
+;	add	nmFreqOutPwmValue2, w		;Add the velocity to sin
+;:Output	mov	w, #128				;Zero offset correction
+;	add	w, nmFreqOutPwmValue1		;Freq1 value
+;	add	w, nmFreqOutPwmValue2		;Freq2 value
+;	add	nmFreqOutPwmAcc, w		;Add pwm value to pwm accumulator
+;	sc
+;	call	@nmSetPinLow			;Output low
+;	snc
+;	call	@nmSetPinHigh			;Output high
+;	call	@nmDecTimeout			;Check the time
+;	sz					;Timeout ?
+;	jmp	:Loop				;No  => Loop again
+;	jmp	@nmReturnNone			;Complete
+
+; ==============================================================================
+;  EERead(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Read a byte from the EEPROM.
+;  Parameters:
+;      PeripherialBank: Bank
+; ==============================================================================
+
+nmAddressHi		=	nmBlockBank + $0	;1st Parameter = Address
+nmAddressLo		=	nmBlockBank + $1
+nmValue			=	nmBlockBank + $3
+
+nm_jstamp_core_EEPROM_eeRead
+	mov	FSR,#nmAddressHi		; Load the address.
+	mov	OP_MSB,nmAddressHi
+	mov	w,nmAddressLo
+	bank	i2c
+	mov	i2c_address_lsb,w
+	mov	i2c_address_msb,OP_MSB
+	call	@I2C_Read		; Perform the read.
+	clr	nmResultH
+	mov	nmResultL,w		; Save the result.
+	jmp	@nmReturnData
+
+; ==============================================================================
+;  EEWrite(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Write a byte to the EEPROM.
+;  Parameters:
+;      PeripherialBank: Bank
+; ==============================================================================
+
+nm_jstamp_core_EEPROM_eeWrite
+	mov	FSR,#nmAddressHi		; Load the address.
+	mov	OP_LSB,nmValue
+	mov	OP_MSB,nmAddressHi
+	mov	w,nmAddressLo
+	bank	i2c
+	mov	i2c_address_lsb,w
+	mov	i2c_address_msb,OP_MSB
+	mov	w,OP_LSB		; Ready the value.
+	call	@I2C_Write		; Perform the write.
+	jmp	@nmReturnNone
+
+; ===============================================================================
+; ===============================================================================
+
+; ==============================================================================
+;  DacInit(PeripheralBank)
+; ==============================================================================
+;  Description:
+;      Installs ISR (peripherial registers must be set prior to calling)
+;      Sets Pin to be an output
+;  Parameters:
+;      PeripherialBank: Bank
+; ==============================================================================
+
+nm_jstamp_core_DAC_install
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	FSR, nmPeriphBank		;Change to given peripheral bank
+	mov	w, #(nmDacPort & %00001111)	;w = offset of IN pin
+	add	FSR, w				;Same bank but FSR pointing to nmUartHSPort
+	call	@nmSetPinLow			;Init pin low
+	call	@nmSetPinOut			;Set pin as an output
+	clr	nmDacValue			;Clear value
+	clr	nmDacAcc			;Clear accumulator
+	mov	nmPeriphISRVec, #nmDac		;Apply new ISR vector
+	jmp	@nmReturnNone
+
+;-------------------------------------------------------------------------------
+; Subroutine: DebugTerminal
+;
+; Add a charater to the terminal memory buffer.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+nm_jstamp_core_terminal_getByte
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	nmResultH,#1
+	mov	w,#comTerminalQuery	; Send a query to the host.
+	call	@DebugSendByteNoTrans
+	call	@DebugGetByte		; Get the reply.
+	mov	SCRATCH0,w
+	cse	SCRATCH0,#comTerminalData
+	jmp	@nmReturnData
+	call	@DebugGetByte		; Get the data byte.
+	clr	nmResultH
+	mov	nmResultL,w		; Save the result.
+	jmp	@nmReturnData
+
+;-------------------------------------------------------------------------------
+; Subroutine: LatchTimer
+;
+; Copy the current timer value into the latch.
+;
+; W on entry: -
+; W on exit : -
+; Variables : -
+;-------------------------------------------------------------------------------
+
+nm_jstamp_core_Timer_latch
+	mov	FSR, #nmBlockBank		;Block bank
+	mov	FSR, nmPeriphBank
+	clrb	nmInterruptFlag		; Synchronize with the ISR so the latching is atomic.
+	call	@nmInterruptSync
+	mov	w,nmTimer1
+	mov	nmLatchTimer1,w
+	mov	w,nmTimer2
+	mov	nmLatchTimer2,w
+	mov	w,nmTimer3
+	mov	nmLatchTimer3,w
+	mov	w,nmTimer4
+	mov	nmLatchTimer4,w
+	jmp	@nmReturnNone
+ENDIF
+
