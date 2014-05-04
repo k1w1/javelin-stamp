@@ -1,0 +1,123 @@
+
+/*
+  .jem File Format: (For version 0.1)
+
+ +---------------+
+ | Flag          | Run/Debug flag.
+ +---------------+
+ +---------------+
+ | Length        | Length of the file in 256 byte multiples.
+ +---------------+
+ +---------------+
+ | Version       | Version stored as BCD major.minor version #.
+ +---------------+
+ +---------------+
+ | NumStatic     | Space required for static variables (measured in bytes).
+ +---------------+
+ | MainOffsetMSB | Offset to the code for the `main' method.
+ | MainOffsetLSB |
+ +---------------+
+ |ObjectOffsetMSB| Offset to the java.lang.Object class for instantiating arrays.
+ |ObjectOffsetLSB|
+ +---------------+
+ |StringOffsetMSB| Offset to the java.lang.String class for instantiating strings.
+ |StringOffsetLSB|
+ +---------------+
+ | ThrowOffsetMSB| Offset to the java.lang.Throwable.throwVMException() method
+ | ThrowOffsetLSB| for throwing exceptions.
+ +---------------+
+ | STOffsetMSB   | Offset to the string table.
+ | STOffsetLSB   |
+ +---------------+
+ | CBOffsetMSB   | Offset to the callback method.
+ | CBOffsetLSB   |
+ +---------------+
+ | OOMOffsetMSB  | Offset to the java.lang.OutOfMemoryError class for JVM errors.
+ | OOMOffsetLSB  |
+ +---------------+
+ | StackBaseMSB  | Base of the stack in memory.
+ | StackBaseLSB  |
+ +---------------+
+ | ArrayClassMSB | Offset to the dummy array class.
+ | ArrayClassLSB |
+ +---------------+
+ +---------------+ First Class:
+ | SuperOffsetMSB| Offset of the superclass from the start of the file.
+ | SuperOffsetLSB|
+ +---------------+
+ | NumFields     | Number of fields in objects of the class.
+ +-+-------------+
+ | NumParams     | Number of method parameters 
+ +-+-------------+
+ | Meth1ETabMSB  | Offset to the exception table for this method.     
+ | Meth1ETabLSB  | Offsets measured from start of file.
+ +---------------+
+ | NumLocals     | Number of local variables (excluding parameters)
+ +---------------+
+ | Flags         | Native method flag.
+ +---------------+
+ | Meth1OffsetMSB| Offset for the first method of this class (and superclass)
+ | Meth1OffsetLSB| Offsets measured from start of file.
+ +---------------+
+ |E|NumParams    | Number of method parameters
+ +---------------+
+ | Meth1ETabMSB  | Offset to the exception table for this method.
+ | Meth1ETabLSB  | Offsets measured from start of file.
+ +---------------+
+ | NumLocals     | Number of local variables (excluding parameters)
+ +---------------+
+ | Flags         | Native method flag.
+ +---------------+
+ | Meth2OffsetMSB| Second method
+ | Meth2OffsetLSB| 
+ +---------------+
+ | ...           |
+ +---------------+
+ +---------------+ Second Class:
+ | SuperOffsetMSB| Offset of the superclass from the start of the file.
+ | SuperOffsetLSB|
+ +---------------+
+ | NumFields     |
+ +---------------+
+ |E|NumParams    |
+ +---------------+
+ | NumLocals     | 
+ +---------------+
+ | Method1 offset|
+ | ...           |
+
+ | code ...      |
+
+ +---------------+ Method exception table.
+ | NumHandlers   |
+ +---------------+
+ | fromMSB       | PC to catch from.
+ | fromLSB       |
+ +---------------+
+ | toMSB         | PC to catch to.
+ | toLSB         |
+ +---------------+
+ | handlerMSB    | Start of the catch handler.
+ | handlerLSB    |
+ +---------------+
+ | TypeMSB       | Offset of the class to catch.
+ | TypeLSB       |
+ +---------------+
+ |...            |
+
+ +---------------+ String offsets table.
+ |Offset0MSB     | Offset to string 0, measured from the start of the file.
+ |Offset0LSB     |
+ +---------------+
+ |Offset1MSB     | Offset to string 1, measured from the start of the file.
+ |Offset1LSB     |
+ +---------------+
+ |...            |
+
+ +---------------+ String data.
+ |...            |
+
+ If the high bit of the high byte of the method offset is set then the method is native. The low byte
+ is then an offset into the native method dispatch table. Thus there can be only 256 native methods.
+
+ */
